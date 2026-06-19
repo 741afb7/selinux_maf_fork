@@ -40,8 +40,9 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_BLOB_ROUTE_MAX VERSION(6, 2, 0)
 #define contains_case_literal(s, len, lit) contains_case_lit((s), (len), (lit), sizeof(lit) - 1)
 
-#define MAGISK_MOCK_POLICY_PATH "/dev/.magisk_selinux_mock/load"
-#define MAGISK_MOCK_POLICY_MAX_SIZE (8 * 1024 * 1024)
+#define MAGISK_POLICY_PATH "/.magisk/selinux/load"
+#define MAGISK_POLICY_REL_PATH ".magisk/selinux/load"
+#define MAGISK_POLICY_MAX_SIZE (8 * 1024 * 1024)
 #define CLEAN_EVAL_SCOPE_SLOTS 8
 #define STATUS_READ_SCOPE_SLOTS 8
 #define SEL_WRITE_OP_CONTEXT 5
@@ -52,7 +53,7 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
-static void *g_funcs[16];
+static void *g_funcs[24];
 static int g_hooks;
 struct file;
 typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
@@ -391,7 +392,6 @@ struct sidtab;
 static void (*sidtab_cancel_convert_fn)(struct sidtab *sidtab);
 static void *(*vmalloc_fn)(unsigned long size);
 static void (*vfree_fn)(const void *addr);
-static struct task_struct *init_task_ptr;
 static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
 static int (*filp_close_fn)(struct file *filp, fl_owner_t id);
 static ssize_t (*kernel_read_fn)(struct file *file, void *buf, size_t count, loff_t *pos);
@@ -435,6 +435,7 @@ static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
 static bool g_simple_read_from_buffer_hooked;
+static bool g_policy_capture_in_progress;
 
 struct access_probe {
     u32 id;
@@ -493,18 +494,19 @@ static bool security_setprocattr_has_lsm_arg(void);
 static void append_u32_dec(char *buf, size_t size, u32 value);
 static unsigned long lookup_name_with_suffix(const char *base);
 static void zero_bytes(void *dst, size_t len);
-static int call_security_read_policy(void **data, size_t *len);
 static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state);
 static void call_selinux_policy_cancel(struct selinux_load_state *load_state);
 static int call_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
+static bool snapshot_magisk_policy_file(const char *reason, bool try_relative);
+static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, bool allow_fallback);
+static void before_security_load_policy(hook_fargs4_t *a, void *u);
+static void after_security_load_policy(hook_fargs4_t *a, void *u);
 static bool context_struct_compute_av_intel(struct policydb *policydb,
                                             struct context *scontext,
                                             struct context *tcontext,
                                             u16 tclass,
                                             struct av_decision *avd,
                                             struct extended_perms *xperms);
-static bool magiskinit_process_exists(void);
-static bool try_snapshot_mock_policy(const char *reason);
 static void try_load_clean_policydb_from_blob(const char *reason);
 static bool filter_procattr_current(const char *hook, const char *lsm,
                                     const char *name, const void *value,
@@ -979,15 +981,6 @@ static unsigned long lookup_name_with_suffix(const char *base)
     return lookup_suffix_by_symbol_walk(base);
 }
 
-static int call_security_read_policy(void **data, size_t *len)
-{
-    if (selinux_compat_call_needed() && security_read_policy_compat_fn)
-        return security_read_policy_compat_fn(g_selinux_state, data, len);
-    if (security_read_policy_fn)
-        return security_read_policy_fn(data, len);
-    return -ENOENT;
-}
-
 static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state)
 {
     if (!security_load_policy_has_load_state())
@@ -1306,25 +1299,8 @@ static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count,
     return kernel_read_fn(file, buf, count, pos);
 }
 
-static bool magiskinit_process_exists(void)
-{
-    struct task_struct *init;
-    struct task_struct *task;
-
-    init = init_task_ptr;
-    if (!init || task_struct_offset.tasks_offset <= 0 ||
-        task_struct_offset.comm_offset <= 0)
-        return false;
-
-    for (task = init; (task = next_task(task)) != init;) {
-        if (str_eq_lit(get_task_comm(task), "magiskinit"))
-            return true;
-    }
-
-    return false;
-}
-
-static bool try_snapshot_mock_policy(const char *reason)
+static bool snapshot_policy_file_path(const char *path, const char *source,
+                                      const char *reason)
 {
     struct file *filp;
     void *data;
@@ -1332,29 +1308,27 @@ static bool try_snapshot_mock_policy(const char *reason)
     loff_t pos;
     ssize_t nread;
 
-    if (!magiskinit_process_exists())
-        return false;
     if (!vmalloc_fn)
         return false;
     if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn) {
-        pr_warn("[selinux_hook] CLEAN mock policy file read disabled reason=%s open=%px close=%px read=%px llseek=%px\n",
+        pr_warn("[selinux_hook] CLEAN Magisk policy file read disabled reason=%s open=%px close=%px read=%px llseek=%px\n",
                 reason ?: "(null)", filp_open_fn, filp_close_fn,
                 kernel_read_fn, vfs_llseek_fn);
         return false;
     }
 
-    filp = filp_open_fn(MAGISK_MOCK_POLICY_PATH, O_RDONLY, 0);
+    filp = filp_open_fn(path, O_RDONLY, 0);
     if (!filp || IS_ERR(filp)) {
-        pr_warn("[selinux_hook] CLEAN mock policy open failed reason=%s path=%s rc=%ld\n",
-                reason ?: "(null)", MAGISK_MOCK_POLICY_PATH,
+        pr_warn("[selinux_hook] CLEAN Magisk policy open failed reason=%s source=%s path=%s rc=%ld\n",
+                reason ?: "(null)", source ?: "unknown", path,
                 filp ? PTR_ERR(filp) : -ENOENT);
         return false;
     }
 
     len = vfs_llseek_fn(filp, 0, SEEK_END);
-    if (len <= 0 || len > MAGISK_MOCK_POLICY_MAX_SIZE) {
-        pr_warn("[selinux_hook] CLEAN mock policy bad len reason=%s path=%s len=%lld\n",
-                reason ?: "(null)", MAGISK_MOCK_POLICY_PATH, len);
+    if (len <= 0 || len > MAGISK_POLICY_MAX_SIZE) {
+        pr_warn("[selinux_hook] CLEAN Magisk policy bad len reason=%s source=%s path=%s len=%lld\n",
+                reason ?: "(null)", source ?: "unknown", path, len);
         filp_close_fn(filp, 0);
         return false;
     }
@@ -1362,8 +1336,8 @@ static bool try_snapshot_mock_policy(const char *reason)
 
     data = vmalloc_fn((unsigned long)len);
     if (!data) {
-        pr_warn("[selinux_hook] CLEAN mock policy alloc failed reason=%s len=%lld\n",
-                reason ?: "(null)", len);
+        pr_warn("[selinux_hook] CLEAN Magisk policy alloc failed reason=%s source=%s len=%lld\n",
+                reason ?: "(null)", source ?: "unknown", len);
         filp_close_fn(filp, 0);
         return false;
     }
@@ -1372,8 +1346,8 @@ static bool try_snapshot_mock_policy(const char *reason)
     nread = call_kernel_read_file(filp, data, (size_t)len, &pos);
     filp_close_fn(filp, 0);
     if (nread != len || pos != len) {
-        pr_warn("[selinux_hook] CLEAN mock policy read failed reason=%s read=%ld pos=%lld len=%lld\n",
-                reason ?: "(null)", (long)nread, pos, len);
+        pr_warn("[selinux_hook] CLEAN Magisk policy read failed reason=%s source=%s read=%ld pos=%lld len=%lld\n",
+                reason ?: "(null)", source ?: "unknown", (long)nread, pos, len);
         if (vfree_fn)
             vfree_fn(data);
         return false;
@@ -1382,10 +1356,20 @@ static bool try_snapshot_mock_policy(const char *reason)
     WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, (size_t)len));
     WRITE_ONCE(g_clean_policy_len, (size_t)len);
     WRITE_ONCE(g_clean_policy_blob, data);
-    pr_info("[selinux_hook] CLEAN mock policy snapshot saved reason=%s path=%s blob=%px len=%zu has_magisk=%d\n",
-            reason ?: "(null)", MAGISK_MOCK_POLICY_PATH, data,
+    pr_info("[selinux_hook] CLEAN Magisk policy snapshot saved reason=%s source=%s path=%s blob=%px len=%zu has_magisk=%d\n",
+            reason ?: "(null)", source ?: "unknown", path, data,
             READ_ONCE(g_clean_policy_len), READ_ONCE(g_clean_policy_has_magisk));
     return true;
+}
+
+static bool snapshot_magisk_policy_file(const char *reason, bool try_relative)
+{
+    if (snapshot_policy_file_path(MAGISK_POLICY_PATH, "magisk_file_abs", reason))
+        return true;
+    if (try_relative &&
+        snapshot_policy_file_path(MAGISK_POLICY_REL_PATH, "magisk_file_rel", reason))
+        return true;
+    return false;
 }
 
 static void refresh_policydb_offset(const char *reason, bool allow_fallback)
@@ -1480,73 +1464,30 @@ static void try_load_clean_policydb_from_blob(const char *reason)
             reason ?: "(null)", policydb, blob, len, CLEAN_POLICYDB_ALLOC_SIZE);
 }
 
-static void snapshot_clean_policy(const char *reason)
+static void activate_clean_policy_blob(const char *reason)
 {
-    void *data = NULL;
-    size_t len = 0;
+    void *data = READ_ONCE(g_clean_policy_blob);
+    size_t len = READ_ONCE(g_clean_policy_len);
     int rc;
 
-    if (READ_ONCE(g_clean_policy_blob))
+    if (!data || !len)
         return;
-    if (READ_ONCE(g_dirty_policy_seen))
-        return;
-
-    if (try_snapshot_mock_policy(reason)) {
-        if (use_clean_blob_route()) {
-            try_load_clean_policydb_from_blob(reason);
-            pr_info("[selinux_hook] CLEAN mock route reason=%s: blob=%px len=%zu policydb=%px direct=%d\n",
-                    reason ?: "(null)", READ_ONCE(g_clean_policy_blob),
-                    READ_ONCE(g_clean_policy_len), READ_ONCE(g_clean_policydb),
-                    READ_ONCE(g_clean_policydb_direct) ? 1 : 0);
-            return;
-        }
-        if (!clean_policydb_redirect_supported()) {
-            try_load_clean_policydb_from_blob(reason);
-            pr_info("[selinux_hook] CLEAN legacy mock blob route reason=%s: blob=%px len=%zu policydb=%px\n",
-                    reason ?: "(null)", READ_ONCE(g_clean_policy_blob),
-                    READ_ONCE(g_clean_policy_len), READ_ONCE(g_clean_policydb));
-            return;
-        }
-        data = READ_ONCE(g_clean_policy_blob);
-        len = READ_ONCE(g_clean_policy_len);
-        goto load_clean_policy;
-    }
-
-    if (!security_read_policy_fn && !security_read_policy_compat_fn)
-        return;
-
-    rc = call_security_read_policy(&data, &len);
-    if (rc || !data || !len) {
-        pr_warn("[selinux_hook] clean policy snapshot failed reason=%s rc=%d data=%px len=%zu\n",
-                reason ?: "(null)", rc, data, len);
-        if (data)
-            if (vfree_fn)
-                vfree_fn(data);
-        return;
-    }
-
-    WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
-    WRITE_ONCE(g_clean_policy_len, len);
-    WRITE_ONCE(g_clean_policy_blob, data);
-    selinux_hook_dbg("[selinux_hook] CLEAN policy snapshot saved reason=%s blob=%px len=%zu has_magisk=%d\n",
-                     reason ?: "(null)", data, len, READ_ONCE(g_clean_policy_has_magisk));
-
-    if (!clean_policydb_redirect_supported()) {
-        try_load_clean_policydb_from_blob(reason);
-        pr_info("[selinux_hook] CLEAN legacy blob route reason=%s: blob=%px len=%zu policydb=%px\n",
-                reason ?: "(null)", data, len, READ_ONCE(g_clean_policydb));
-        return;
-    }
 
     if (use_clean_blob_route()) {
         try_load_clean_policydb_from_blob(reason);
-        pr_info("[selinux_hook] CLEAN 5.10-6.1 route reason=%s: skip staged security_load_policy, blob=%px len=%zu policydb=%px direct=%d\n",
+        pr_info("[selinux_hook] CLEAN policy blob route reason=%s: blob=%px len=%zu policydb=%px direct=%d\n",
                 reason ?: "(null)", data, len, READ_ONCE(g_clean_policydb),
                 READ_ONCE(g_clean_policydb_direct) ? 1 : 0);
         return;
     }
 
-load_clean_policy:
+    if (!clean_policydb_redirect_supported()) {
+        try_load_clean_policydb_from_blob(reason);
+        pr_info("[selinux_hook] CLEAN legacy policy blob route reason=%s: blob=%px len=%zu policydb=%px\n",
+                reason ?: "(null)", data, len, READ_ONCE(g_clean_policydb));
+        return;
+    }
+
     if (!security_load_policy_has_load_state()) {
         try_load_clean_policydb_from_blob(reason);
         pr_info("[selinux_hook] CLEAN policy load skipped reason=%s: legacy security_load_policy commits live policy, blob fallback active\n",
@@ -1574,6 +1515,107 @@ load_clean_policy:
                     rc, g_clean_load_state.policy);
         }
     }
+}
+
+static void snapshot_clean_policy(const char *reason)
+{
+    if (READ_ONCE(g_clean_policy_blob))
+        return;
+    if (READ_ONCE(g_dirty_policy_seen))
+        return;
+
+    if (!snapshot_magisk_policy_file(reason, true))
+        return;
+
+    activate_clean_policy_blob(reason);
+}
+
+static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
+                                           bool allow_fallback)
+{
+    void *data = NULL;
+    size_t len = 0;
+
+    if (READ_ONCE(g_clean_policy_blob))
+        return true;
+    if (READ_ONCE(g_dirty_policy_seen))
+        return false;
+
+    if (snapshot_magisk_policy_file(stage, true)) {
+        activate_clean_policy_blob(stage);
+        return READ_ONCE(g_clean_policy_blob) != NULL;
+    }
+
+    if (!allow_fallback) {
+        selinux_hook_dbg("[selinux_hook] CLEAN Magisk policy unavailable during %s; waiting for after security_load_policy\n",
+                         stage ?: "before");
+        return false;
+    }
+
+    if (!a)
+        return false;
+
+    if (selinux_compat_call_needed()) {
+        data = (void *)a->arg1;
+        len = (size_t)a->arg2;
+    } else {
+        data = (void *)a->arg0;
+        len = (size_t)a->arg1;
+    }
+
+    if (!data || !len || len > MAGISK_POLICY_MAX_SIZE || !vmalloc_fn) {
+        pr_warn("[selinux_hook] CLEAN security_load_policy fallback rejected stage=%s data=%px len=%zu vmalloc=%px\n",
+                stage ?: "after", data, len, vmalloc_fn);
+        return false;
+    }
+
+    {
+        void *src = data;
+        void *copy = vmalloc_fn((unsigned long)len);
+
+        if (!copy) {
+            pr_warn("[selinux_hook] CLEAN security_load_policy fallback alloc failed stage=%s len=%zu\n",
+                    stage ?: "after", len);
+            return false;
+        }
+        copy_bytes(copy, src, len);
+        data = copy;
+    }
+    if (!data) {
+        pr_warn("[selinux_hook] CLEAN security_load_policy fallback alloc failed stage=%s len=%zu\n",
+                stage ?: "after", len);
+        return false;
+    }
+
+    WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
+    WRITE_ONCE(g_clean_policy_len, len);
+    WRITE_ONCE(g_clean_policy_blob, data);
+    pr_warn("[selinux_hook] CLEAN policy captured from security_load_policy args stage=%s blob=%px len=%zu has_magisk=%d\n",
+            stage ?: "after", data, len, READ_ONCE(g_clean_policy_has_magisk));
+    activate_clean_policy_blob(stage ?: "security_load_policy");
+    return true;
+}
+
+static void before_security_load_policy(hook_fargs4_t *a, void *u)
+{
+    if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
+        return;
+
+    g_policy_capture_in_progress = true;
+    finish_deferred_policy_capture(a, "before_security_load_policy", false);
+    g_policy_capture_in_progress = false;
+}
+
+static void after_security_load_policy(hook_fargs4_t *a, void *u)
+{
+    if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
+        return;
+    if (a && (long)a->ret)
+        return;
+
+    g_policy_capture_in_progress = true;
+    finish_deferred_policy_capture(a, "after_security_load_policy", true);
+    g_policy_capture_in_progress = false;
 }
 
 static bool contains_magisk(const char *s, size_t len)
@@ -3126,14 +3168,11 @@ static long init(const char *args, const char *event, void *__user r)
     if (!vmalloc_fn)
         vmalloc_fn = (void *)kallsyms_lookup_name("vmalloc_noprof");
     vfree_fn = (void *)kallsyms_lookup_name("vfree");
-    init_task_ptr = (void *)kallsyms_lookup_name("init_task");
     filp_open_fn = (void *)kallsyms_lookup_name("filp_open");
     filp_close_fn = (void *)kallsyms_lookup_name("filp_close");
     kernel_read_fn = (void *)kallsyms_lookup_name("kernel_read");
     vfs_llseek_fn = (void *)kallsyms_lookup_name("vfs_llseek");
     g_selinux_state = (void *)kallsyms_lookup_name("selinux_state");
-    if (!init_task_ptr)
-        pr_warn("[selinux_hook] cannot find init_task, mock policy process gate disabled\n");
     if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn)
         pr_warn("[selinux_hook] cannot find file-read symbols: filp_open=%px filp_close=%px kernel_read=%px vfs_llseek=%px\n",
                 filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn);
@@ -3166,9 +3205,8 @@ static long init(const char *args, const char *event, void *__user r)
     if (!sidtab_cancel_convert_fn)
         pr_warn("[selinux_hook] cannot find sidtab_cancel_convert, clean snapshot may leave live policy busy\n");
     if (!security_read_policy_fn)
-        pr_warn("[selinux_hook] cannot find security_read_policy, clean policy snapshot disabled\n");
-    else
-        snapshot_clean_policy("module_init");
+        pr_warn("[selinux_hook] cannot find security_read_policy, policy read hook disabled\n");
+    snapshot_clean_policy("module_init");
     if (!security_context_to_sid_fn)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
@@ -3256,9 +3294,16 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     if (!security_load_policy_fn) {
-        pr_warn("[selinux_hook] cannot find security_load_policy, live policy load audit disabled\n");
+        pr_warn("[selinux_hook] cannot find security_load_policy, deferred clean policy capture disabled\n");
+    } else if (!READ_ONCE(g_clean_policy_blob)) {
+        int argc = selinux_compat_call_needed() ? 4 : 3;
+
+        g_funcs[g_hooks++] = (void *)security_load_policy_fn;
+        pr_info("[selinux_hook] hook security_load_policy argc=%d for deferred Magisk policy capture\n", argc);
+        hook_wrap((void *)security_load_policy_fn, argc,
+                  before_security_load_policy, after_security_load_policy, NULL);
     } else {
-        selinux_hook_dbg("[selinux_hook] security_load_policy hook skipped; clean snapshots call it directly\n");
+        selinux_hook_dbg("[selinux_hook] security_load_policy capture skipped; clean policy already loaded\n");
     }
 
     addr = (unsigned long)kallsyms_lookup_name("security_setprocattr");
@@ -3347,6 +3392,7 @@ static long exit_(void *__user r)
 {
     uninstall_write_op_hooks();
     uninstall_inline_hooks();
+    g_policy_capture_in_progress = false;
 
     if (READ_ONCE(g_clean_policydb_direct) && g_clean_policydb) {
         if (policydb_destroy_fn)
