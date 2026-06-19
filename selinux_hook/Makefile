@@ -15,15 +15,20 @@ else ifdef ANDROID_NDK_HOME
     NDK_PATH ?= $(ANDROID_NDK_HOME)/$(NDK_BIN_DIR)
 endif
 
+GCC_PREFIX ?= aarch64-none-linux-gnu-
+
 ifdef TARGET_COMPILE
     CC := $(TARGET_COMPILE)gcc
     LD := $(TARGET_COMPILE)ld
+else ifneq ($(GCC_PREFIX),)
+    CC := $(GCC_PREFIX)gcc
+    LD := $(GCC_PREFIX)ld
 else ifdef NDK_PATH
     CC := $(NDK_PATH)/aarch64-linux-android31-clang
     LD := $(NDK_PATH)/ld.lld
 endif
 
-CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-common -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
+CFLAGS = -Wall -O2 -ffreestanding -fno-PIC -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -fno-common -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
 CFLAGS += -std=gnu99
 
 INCLUDE_DIRS := . include patch/include linux linux/include linux/security/selinux/include linux/arch/arm64/include linux/tools/arch/arm64/include
