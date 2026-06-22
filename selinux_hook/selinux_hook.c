@@ -25,10 +25,10 @@
 #include <kpmodule.h>
 #include <kputils.h>
 
-KPM_NAME("selinux_magisk_access_filter");
+KPM_NAME("selinux_MAF_fork");
 KPM_VERSION("1.1.0");
-KPM_LICENSE("All rights reserved.");
-KPM_AUTHOR("Admire");
+KPM_LICENSE("GPL v3");
+KPM_AUTHOR("Admire, 741afb7");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 
 #define ACCESS_SAMPLE_MAX 256
