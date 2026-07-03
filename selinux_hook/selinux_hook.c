@@ -468,6 +468,8 @@ static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
 
 static bool contains_magisk(const char *s, size_t len);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
+static bool dirtysepolicy_context_should_hide(const char *query);
+static bool dirtysepolicy_access_should_deny(const char *query, size_t len);
 static bool clean_context_exists(const char *query);
 static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query);
 static bool legacy_should_block_access_query(const char *query, size_t len);
@@ -1896,6 +1898,56 @@ static bool clean_context_exists(const char *query)
     return clean_context_token_exists(query, token_len(query));
 }
 
+static bool token_eq_lit(const char *token, size_t len, const char *lit)
+{
+    size_t i;
+
+    if (!token || !lit)
+        return false;
+
+    for (i = 0; i < len; i++) {
+        if (!lit[i] || !ascii_lower_eq(token[i], lit[i]))
+            return false;
+    }
+
+    return lit[i] == '\0';
+}
+
+static bool context_token_matches(const char *query, const char *lit)
+{
+    const char *ctx = skip_spaces(query);
+
+    return token_eq_lit(ctx, token_len(ctx), lit);
+}
+
+static bool dirtysepolicy_context_should_hide(const char *query)
+{
+    /*
+     * DirtySepolicy contextExists() probes these labels through
+     * /sys/fs/selinux/context, /sys/fs/selinux/access fallback, and finally
+     * /proc/self/attr/current.  Return -EINVAL for app-side probes so a dirty
+     * live policy does not reveal root framework labels.
+     */
+    if (context_token_matches(query, "u:r:adbroot:s0"))
+        return true;
+    if (context_token_matches(query, "u:r:magisk:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:magisk_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:r:ksu:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:ksu_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:lsposed_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:xposed_data:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:xposed_file:s0"))
+        return true;
+
+    return false;
+}
+
 static const char *next_token(const char *s)
 {
     s = skip_spaces(s);
@@ -1924,8 +1976,64 @@ static bool clean_access_contexts_exist(const char *query)
     return true;
 }
 
+static bool access_contexts_match(const char *query, const char *src_lit,
+                                  const char *dst_lit)
+{
+    const char *src;
+    const char *dst;
+
+    src = skip_spaces(query);
+    dst = next_token(src);
+
+    return token_eq_lit(src, token_len(src), src_lit) &&
+           token_eq_lit(dst, token_len(dst), dst_lit);
+}
+
+static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
+{
+    const char *src;
+    const char *dst;
+
+    if (!query || !len)
+        return false;
+
+    src = skip_spaces(query);
+    dst = next_token(src);
+
+    /*
+     * contextExists() second stage calls /access with the same hidden context
+     * as source and target.  Hide either side to keep the fallback consistent.
+     */
+    if (dirtysepolicy_context_should_hide(src) ||
+        dirtysepolicy_context_should_hide(dst))
+        return true;
+
+    if (access_contexts_match(query, "u:r:system_server:s0", "u:r:system_server:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:shell:s0", "u:r:su:s0"))
+        return true;
+    if (access_contexts_match(query, "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:kernel:s0", "u:object_r:tmpfs:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:kernel:s0", "u:object_r:adb_data_file:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:system_server:s0", "u:object_r:apk_data_file:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:dex2oat:s0", "u:object_r:dex2oat_exec:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:zygote:s0", "u:object_r:adb_data_file:s0"))
+        return true;
+
+    return false;
+}
+
 static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query)
 {
+    if (access_query && dirtysepolicy_access_should_deny(query, len))
+        return true;
+    if (!access_query && dirtysepolicy_context_should_hide(query))
+        return true;
     if (legacy_should_block_access_query(query, len))
         return true;
     if (!READ_ONCE(g_clean_policy_blob))
@@ -1942,6 +2050,8 @@ static bool legacy_should_block_access_query(const char *query, size_t len)
     if (!query || !len)
         return false;
 
+    if (dirtysepolicy_access_should_deny(query, len))
+        return true;
     if (contains_case_literal(query, len, "magisk"))
         return true;
     if (contains_case_literal(query, len, "ksu_file"))
@@ -2391,6 +2501,24 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
+    if (dirtysepolicy_access_should_deny(sample, sample_len)) {
+        n = READ_ONCE(g_clean_access_count) + 1;
+        WRITE_ONCE(g_clean_access_count, n);
+        a->local.data0 = 4;
+        a->local.data1 = n;
+        slot = n & (ACCESS_PROBE_SLOTS - 1);
+        a->local.data2 = slot;
+        g_probes[slot].id = n;
+        g_probes[slot].uid = uid;
+        g_probes[slot].node = "access";
+        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+        pr_info("[selinux_hook] DIRTYSEPOLICY deny /sys/fs/selinux/access #%u uid=%d comm=%s query=\"%s\"\n",
+                n, uid, current_comm(), sample);
+        a->skip_origin = 1;
+        a->ret = -EINVAL;
+        return;
+    }
+    
     if (!clean_policydb_redirect_supported()) {
         snapshot_clean_policy("legacy_access");
         if (legacy_clean_query_should_block(sample, sample_len, true)) {
@@ -2467,6 +2595,24 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("context", uid, sample);
+        return;
+    }
+
+    if (dirtysepolicy_context_should_hide(sample)) {
+        n = READ_ONCE(g_clean_access_count) + 1;
+        WRITE_ONCE(g_clean_access_count, n);
+        a->local.data0 = 4;
+        a->local.data1 = n;
+        slot = n & (ACCESS_PROBE_SLOTS - 1);
+        a->local.data2 = slot;
+        g_probes[slot].id = n;
+        g_probes[slot].uid = uid;
+        g_probes[slot].node = "context";
+        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+        pr_info("[selinux_hook] DIRTYSEPOLICY hide /sys/fs/selinux/context #%u uid=%d comm=%s query=\"%s\"\n",
+                n, uid, current_comm(), sample);
+        a->skip_origin = 1;
+        a->ret = -EINVAL;
         return;
     }
 
@@ -2646,7 +2792,10 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     sample_len = value && size ? copy_query_sample(sample, (const char *)value, size) : 0;
     manager = current_is_policy_manager();
     if (!manager) {
-        if (!READ_ONCE(g_clean_policydb) && READ_ONCE(g_clean_policy_blob) &&
+        if (dirtysepolicy_context_should_hide(sample)) {
+            clean_checked = true;
+            clean_ret = -EINVAL;
+        } else if (!READ_ONCE(g_clean_policydb) && READ_ONCE(g_clean_policy_blob) &&
             legacy_should_block_access_query(sample, sample_len)) {
             clean_checked = true;
             clean_ret = -EINVAL;
