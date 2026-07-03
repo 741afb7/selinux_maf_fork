@@ -52,6 +52,15 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
+typedef enum {
+    SEL_HOOK_STATE_FULL_FALLBACK = 0,
+    SEL_HOOK_STATE_PARTIAL_FALLBACK,
+    SEL_HOOK_STATE_NORMAL_K,  
+    SEL_HOOK_STATE_NORMAL_M   
+} sel_hook_state_t;
+
+static bool g_hook_context_compute_av_ok; // Legacy AV hook attachment status flag, used to identify the working mode
+
 static void *g_funcs[24];
 static int g_hooks;
 struct file;
@@ -3655,6 +3664,7 @@ static long init(const char *args, const char *event, void *__user r)
             g_funcs[g_hooks++] = (void *)addr;
             pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
             hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
+			WRITE_ONCE(g_hook_context_compute_av_ok, true); // Mark legacy AV hook mounted successfully, used to identify the working mode
         }
     } else {
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
@@ -3735,27 +3745,77 @@ static long exit_(void *__user r)
     selinux_hook_dbg("[selinux_hook] exited\n");
     return 0;
 }
-static long control(const char* args, char* __user out_msg, int outlen) {
 
-    int rc = 0;
-    char echo[64] = "";
-    if (rc < 0) {
-    sprintf(echo, "error, rc=%d\n", rc);
-        logke("fg_sram_write %s", echo);
-        if (out_msg) {
-            compat_copy_to_user(out_msg, echo, sizeof(echo));
-            return 1;
-        }
-    } else {
-        sprintf(echo, "success resp\n");
-        logki("fg_sram_write %s", echo);
-        if (out_msg) {
-            compat_copy_to_user(out_msg, echo, sizeof(echo));
-            return 0;
-        }
-    }
-    return 0;
+static sel_hook_state_t module_get_working_mode(void) // Used to identify the working mode
+{
+    bool redirect_supported = clean_policydb_redirect_supported();
+    bool has_clean_policydb = READ_ONCE(g_clean_policydb) != NULL;
+    bool has_clean_blob = READ_ONCE(g_clean_policy_blob) != NULL;
+    bool legacy_av_disabled = READ_ONCE(g_clean_policydb_av_disabled);
+
+    // NORMAL-K
+    if (redirect_supported && has_clean_policydb)
+        return SEL_HOOK_STATE_NORMAL_K;
+
+    // NORMAL-M
+    if (!redirect_supported &&
+        READ_ONCE(g_hook_context_compute_av_ok) &&
+        has_clean_policydb &&
+        !legacy_av_disabled)
+        return SEL_HOOK_STATE_NORMAL_M;
+
+    // PARTIAL
+    if (has_clean_blob || has_clean_policydb)
+        return SEL_HOOK_STATE_PARTIAL_FALLBACK;
+
+    // FULL
+    return SEL_HOOK_STATE_FULL_FALLBACK;
 }
+
+static long control(const char* args, char* __user out_msg, int outlen)
+{
+    sel_hook_state_t state;
+    const char *state_str;
+    int copied;
+    size_t len;
+
+    if (!args || !out_msg || outlen <= 0)
+        return -EINVAL;
+
+    if (str_eq_lit(args, "mode")) {
+        state = module_get_working_mode();
+        switch (state) {
+        case SEL_HOOK_STATE_NORMAL_K:
+            state_str = "NORMAL-K";
+            break;
+        case SEL_HOOK_STATE_NORMAL_M:
+            state_str = "NORMAL-M";
+            break;
+        case SEL_HOOK_STATE_PARTIAL_FALLBACK:
+            state_str = "PARTIAL_FALLBACK";
+            break;
+        case SEL_HOOK_STATE_FULL_FALLBACK:
+            state_str = "FULL_FALLBACK";
+            break;
+        default:
+            state_str = "UNKNOWN";
+            break;
+        }
+
+        len = str_len_safe(state_str);
+        if (outlen < len)
+            return -EINVAL;
+        
+        copied = compat_copy_to_user(out_msg, state_str, (int)len);
+        if (copied != (int)len)
+            return -EFAULT;
+        
+        return 0;
+    }
+    
+    return -EINVAL;
+}
+
 KPM_INIT(init);
 KPM_CTL0(control);
 KPM_EXIT(exit_);
