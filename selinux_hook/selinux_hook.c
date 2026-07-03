@@ -486,8 +486,7 @@ static bool selinux_compat_call_needed(void);
 static bool policydb_offset_fallback_allowed(void);
 static bool write_op_slot_fallback_allowed(void);
 static bool security_setprocattr_has_lsm_arg(void);
-static void append_u32_dec(char *buf, size_t size, u32 value);
-static unsigned long lookup_name_with_suffix(const char *base);
+static void resolve_required_symbols_once(void);
 static void *lookup_name_optional_suffix(const char *base);
 static void log_symbol_addr(const char *name, const void *addr);
 static void zero_bytes(void *dst, size_t len);
@@ -826,37 +825,79 @@ static bool security_load_policy_has_load_state(void)
     return selinux_policy_cancel_fn || selinux_policy_cancel_compat_fn;
 }
 
-static void append_u32_dec(char *buf, size_t size, u32 value)
-{
-    char tmp[10];
-    size_t pos = 0;
-    size_t i = 0;
-
-    if (!buf || !size)
-        return;
-
-    while (pos < size && buf[pos])
-        pos++;
-    if (pos >= size - 1)
-        return;
-
-    do {
-        tmp[i++] = (char)('0' + (value % 10));
-        value /= 10;
-    } while (value && i < sizeof(tmp));
-
-    while (i && pos < size - 1)
-        buf[pos++] = tmp[--i];
-    buf[pos] = '\0';
-}
-
-struct suffix_lookup {
+struct symbol_cache_entry {
     const char *base;
+    size_t len;
     unsigned long addr;
+    bool exact;
+    bool suffixed;
 };
 
 typedef int (*kallsyms_on_each_symbol_nomod_fn)(int (*fn)(void *, const char *, unsigned long),
                                                 void *data);
+
+#define SYMBOL_CACHE_ENTRY(name) { name, 0, 0, false, false }
+
+static struct symbol_cache_entry g_symbol_cache[] = {
+    SYMBOL_CACHE_ENTRY("_raw_spin_lock"),
+    SYMBOL_CACHE_ENTRY("_raw_spin_unlock"),
+    SYMBOL_CACHE_ENTRY("copy_from_kernel_nofault"),
+    SYMBOL_CACHE_ENTRY("probe_kernel_read"),
+    SYMBOL_CACHE_ENTRY("copy_to_user_nofault"),
+    SYMBOL_CACHE_ENTRY("_copy_to_user"),
+    SYMBOL_CACHE_ENTRY("__copy_to_user"),
+    SYMBOL_CACHE_ENTRY("vmalloc"),
+    SYMBOL_CACHE_ENTRY("vmalloc_noprof"),
+    SYMBOL_CACHE_ENTRY("vfree"),
+    SYMBOL_CACHE_ENTRY("filp_open"),
+    SYMBOL_CACHE_ENTRY("filp_close"),
+    SYMBOL_CACHE_ENTRY("kernel_read"),
+    SYMBOL_CACHE_ENTRY("vfs_llseek"),
+    SYMBOL_CACHE_ENTRY("selinux_state"),
+    SYMBOL_CACHE_ENTRY("security_load_policy"),
+    SYMBOL_CACHE_ENTRY("security_context_to_sid"),
+    SYMBOL_CACHE_ENTRY("policydb_read"),
+    SYMBOL_CACHE_ENTRY("policydb_destroy"),
+    SYMBOL_CACHE_ENTRY("flex_array_get"),
+    SYMBOL_CACHE_ENTRY("avtab_search_node"),
+    SYMBOL_CACHE_ENTRY("avtab_search_node_next"),
+    SYMBOL_CACHE_ENTRY("cond_compute_av"),
+    SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
+    SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
+    SYMBOL_CACHE_ENTRY("selinux_policy_cancel"),
+    SYMBOL_CACHE_ENTRY("sidtab_cancel_convert"),
+    SYMBOL_CACHE_ENTRY("security_read_policy"),
+    SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
+    SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
+    SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
+    SYMBOL_CACHE_ENTRY("selinux_status_update_seqlock"),
+    SYMBOL_CACHE_ENTRY("selinux_status_update_policyload"),
+    SYMBOL_CACHE_ENTRY("security_setprocattr"),
+    SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
+    SYMBOL_CACHE_ENTRY("sel_write_access"),
+    SYMBOL_CACHE_ENTRY("sel_write_context"),
+    SYMBOL_CACHE_ENTRY("write_op"),
+    SYMBOL_CACHE_ENTRY("context_struct_compute_av"),
+    SYMBOL_CACHE_ENTRY("string_to_context_struct"),
+    SYMBOL_CACHE_ENTRY("selinux_complete_init"),
+    SYMBOL_CACHE_ENTRY("selinux_policy_commit"),
+};
+
+#define SYMBOL_CACHE_COUNT (sizeof(g_symbol_cache) / sizeof(g_symbol_cache[0]))
+
+static bool g_symbol_cache_resolved;
+
+static size_t str_len_safe(const char *s)
+{
+    size_t len = 0;
+
+    if (!s)
+        return 0;
+
+    while (s[len])
+        len++;
+    return len;
+}
 
 static bool suffix_contains_cfi(const char *suffix)
 {
@@ -874,125 +915,173 @@ static bool suffix_contains_cfi(const char *suffix)
     return false;
 }
 
-static bool symbol_has_compiler_suffix(const char *name, const char *base)
+static bool symbol_name_matches(const char *name, const char *base, size_t len)
 {
     size_t i;
 
     if (!name || !base)
         return false;
 
-    for (i = 0; base[i]; i++) {
+    for (i = 0; i < len; i++) {
         if (name[i] != base[i])
             return false;
     }
 
-    if (!(name[i] == '.' || name[i] == '$') || !name[i + 1])
+    return name[len] == '\0';
+}
+
+static bool symbol_has_compiler_suffix(const char *name, const char *base, size_t len)
+{
+    size_t i;
+
+    if (!name || !base || !len)
+        return false;
+
+    for (i = 0; i < len; i++) {
+        if (name[i] != base[i])
+            return false;
+    }
+
+    if (!(name[len] == '.' || name[len] == '$') || !name[len + 1])
         return false;
 
     /* Skip CFI stub variants; they redirect to the real function */
-    if (suffix_contains_cfi(name + i + 1))
+    if (suffix_contains_cfi(name + len + 1))
         return false;
 
     return true;
 }
 
-static int lookup_name_with_suffix_cb(void *data, const char *name,
-                                      struct module *module, unsigned long addr)
+static void prepare_symbol_cache(void)
 {
-    struct suffix_lookup *lookup = data;
+    size_t i;
 
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++)
+        g_symbol_cache[i].len = str_len_safe(g_symbol_cache[i].base);
+}
+
+static void cache_symbol_match(const char *name, unsigned long addr)
+{
+    size_t i;
+
+    if (!name || !addr)
+        return;
+
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        struct symbol_cache_entry *entry = &g_symbol_cache[i];
+
+        if (!entry->base || !entry->len || entry->exact)
+            continue;
+
+        if (symbol_name_matches(name, entry->base, entry->len)) {
+            entry->addr = addr;
+            entry->exact = true;
+            entry->suffixed = false;
+            continue;
+        }
+
+        if (!entry->addr &&
+            symbol_has_compiler_suffix(name, entry->base, entry->len)) {
+            entry->addr = addr;
+            entry->suffixed = true;
+        }
+    }
+}
+
+static int cache_symbol_cb(void *data, const char *name,
+                           struct module *module, unsigned long addr)
+{
+    (void)data;
     (void)module;
-    if (!lookup || lookup->addr || !addr)
-        return 0;
 
-    if (!symbol_has_compiler_suffix(name, lookup->base))
-        return 0;
-
-    lookup->addr = addr;
-    selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                     lookup->base, name, addr);
-    return 1;
+    cache_symbol_match(name, addr);
+    return 0;
 }
 
-static int lookup_name_with_suffix_cb_nomod(void *data, const char *name,
-                                            unsigned long addr)
+static int cache_symbol_cb_nomod(void *data, const char *name, unsigned long addr)
 {
-    struct suffix_lookup *lookup = data;
+    (void)data;
 
-    if (!lookup || lookup->addr || !addr)
-        return 0;
-
-    if (!symbol_has_compiler_suffix(name, lookup->base))
-        return 0;
-
-    lookup->addr = addr;
-    selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                     lookup->base, name, addr);
-    return 1;
+    cache_symbol_match(name, addr);
+    return 0;
 }
 
-static unsigned long lookup_suffix_by_symbol_walk(const char *base)
+static void resolve_required_symbols_once(void)
 {
-    struct suffix_lookup lookup;
+    size_t i;
+    u32 found = 0;
+    u32 suffixed = 0;
+    u32 missing = 0;
 
-    if (!kallsyms_on_each_symbol)
-        return 0;
+    if (READ_ONCE(g_symbol_cache_resolved))
+        return;
 
-    lookup.base = base;
-    lookup.addr = 0;
+    prepare_symbol_cache();
 
-    if (kver <= VERSION(6, 1, 0)) {
-        kallsyms_on_each_symbol(lookup_name_with_suffix_cb, &lookup);
+    if (!kallsyms_on_each_symbol) {
+        pr_warn("[selinux_hook] kallsyms_on_each_symbol missing; falling back to exact symbol lookups only\n");
+        for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+            unsigned long addr;
+
+            addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
+            if (addr) {
+                g_symbol_cache[i].addr = addr;
+                g_symbol_cache[i].exact = true;
+            }
+        }
+    } else if (kver <= VERSION(6, 1, 0)) {
+        kallsyms_on_each_symbol(cache_symbol_cb, NULL);
     } else {
         kallsyms_on_each_symbol_nomod_fn on_each_symbol;
 
         on_each_symbol = (kallsyms_on_each_symbol_nomod_fn)kallsyms_on_each_symbol;
-        on_each_symbol(lookup_name_with_suffix_cb_nomod, &lookup);
+        on_each_symbol(cache_symbol_cb_nomod, NULL);
     }
 
-    return lookup.addr;
-}
-
-static unsigned long lookup_name_with_suffix(const char *base)
-{
-    char name[96];
-    size_t i;
-    u32 n;
-    unsigned long addr;
-
-    if (!base)
-        return 0;
-
-    for (n = 0; n < 256; n++) {
-        for (i = 0; i < sizeof(name) - 1 && base[i]; i++)
-            name[i] = base[i];
-        if (i >= sizeof(name) - 2)
-            return 0;
-        name[i++] = '.';
-        name[i] = '\0';
-        append_u32_dec(name, sizeof(name), n);
-        addr = (unsigned long)kallsyms_lookup_name(name);
-        if (addr) {
-            selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                             base, name, addr);
-            return addr;
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (g_symbol_cache[i].addr) {
+            found++;
+            if (g_symbol_cache[i].suffixed)
+                suffixed++;
+        } else {
+            missing++;
         }
     }
 
-    return lookup_suffix_by_symbol_walk(base);
+    WRITE_ONCE(g_symbol_cache_resolved, true);
+    pr_info("[selinux_hook] symbol cache resolved in one pass: found=%u suffixed=%u missing=%u\n",
+            found, suffixed, missing);
 }
 
-static void *lookup_name_optional_suffix(const char *base)
+static struct symbol_cache_entry *find_cached_symbol(const char *base)
 {
-    unsigned long addr;
+    size_t i;
 
     if (!base)
         return NULL;
 
-    addr = (unsigned long)kallsyms_lookup_name(base);
-    if (!addr)
-        addr = lookup_name_with_suffix(base);
-    return (void *)addr;
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (str_eq_lit(base, g_symbol_cache[i].base))
+            return &g_symbol_cache[i];
+    }
+
+    return NULL;
+}
+
+static void *lookup_name_optional_suffix(const char *base)
+{
+    struct symbol_cache_entry *entry;
+
+    if (!base)
+        return NULL;
+
+    resolve_required_symbols_once();
+
+    entry = find_cached_symbol(base);
+    if (entry)
+        return (void *)entry->addr;
+
+    return (void *)kallsyms_lookup_name(base);
 }
 
 static void log_symbol_addr(const char *name, const void *addr)
@@ -3062,14 +3151,15 @@ static long init(const char *args, const char *event, void *__user r)
     pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0,
             use_clean_blob_route() ? 1 : 0);
+    resolve_required_symbols_once();
 
     /* Raw spinlock helpers — kfunc wrappers are not exported on this kernel,
      * so resolve through kallsyms and call via function pointer.  The locks
      * become no-ops if resolution fails, which is acceptable for these
      * scope arrays (they only see per-task scope entry/exit pairs that
      * are also serialized against themselves). */
-    g_raw_spin_lock_fn = (raw_spin_lock_fn_t)kallsyms_lookup_name("_raw_spin_lock");
-    g_raw_spin_unlock_fn = (raw_spin_unlock_fn_t)kallsyms_lookup_name("_raw_spin_unlock");
+    g_raw_spin_lock_fn = (raw_spin_lock_fn_t)lookup_name_optional_suffix("_raw_spin_lock");
+    g_raw_spin_unlock_fn = (raw_spin_unlock_fn_t)lookup_name_optional_suffix("_raw_spin_unlock");
     if (!g_raw_spin_lock_fn || !g_raw_spin_unlock_fn)
         pr_warn("[selinux_hook] raw_spin_lock/unlock unresolved: lock=%px unlock=%px; scope/cache lock will be a no-op\n",
                 g_raw_spin_lock_fn, g_raw_spin_unlock_fn);
