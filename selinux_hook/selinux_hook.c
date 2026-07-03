@@ -757,10 +757,30 @@ static bool use_legacy_clean_blob_query(void)
 static bool clean_policydb_redirect_supported(void)
 {
     /*
-     * Xiaomi sm8150/cepheus 4.14 trees keep selinux_state and use the
-     * policydb-argument context_struct_compute_av() signature.  Treat
-     * selinux_state as the 4.14 baseline signal, while preserving the old
-     * pure-legacy route for kernels without that symbol.
+     * 4.14 reference basis:
+     *   - https://github.com/balgxmr/kernel_xiaomi_cepheus/tree/sixteen
+     *   - https://github.com/LineageOS/android_kernel_xiaomi_sm8150/tree/lineage-22.2
+     *   - https://android.googlesource.com/kernel/common/+/refs/heads/deprecated/android-4.14-stable
+     *
+     * Relevant source paths:
+     *   - security/selinux/ss/services.c
+     *       context_struct_compute_av(struct policydb *policydb, ...)
+     *       security_read_policy(struct selinux_state *state, ...)
+     *       security_context_to_sid(struct selinux_state *state, ...)
+     *       security_load_policy(struct selinux_state *state, ...)
+     *   - security/selinux/selinuxfs.c
+     *       sel_write_access(), sel_write_context(), write_op[]
+     *
+     * 这里的 4.14 适配不是单纯按 kver 猜 ABI，而是用上述 cepheus/sm8150
+     * 4.14 源码确认 SELinux helper 的真实签名。只要运行时能解析到
+     * selinux_state，就认为它符合这组 4.14 stateful SELinux 布局；否则
+     * 回退到更保守的 legacy 路径，避免把 policydb 参数强套到未知布局上。
+     *
+     * The Xiaomi sm8150/cepheus 4.14 lineage keeps selinux_state and also uses
+     * the policydb-argument context_struct_compute_av() signature.  Therefore
+     * selinux_state is the runtime confidence signal for using the 4.14
+     * stateful SELinux helper signatures and the 6-argument policydb redirect
+     * path.  Kernels older than this baseline stay on the pure legacy route.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
@@ -804,26 +824,75 @@ static void log_bypass_once(const char *node, uid_t uid, const char *query)
 
 static bool selinux_compat_call_needed(void)
 {
-    return g_selinux_state && kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
+    /*
+     * 4.14 参考源码里的 security_read_policy() / security_context_to_sid()
+     * 都需要 struct selinux_state * 作为第一个参数。这里用 selinux_state
+     * 作为运行时信号，避免在没有 stateful ABI 的旧内核上误传参数。
+     *
+     * security_read_policy() and security_context_to_sid() are stateful on the
+     * 4.14 sources listed above.  Keep the state argument through the Android
+     * common stateful era, and stop before the newer 6.4+ LSM refactors where
+     * this KPM has not been audited.
+     */
+	return g_selinux_state && kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
 }
 
 static bool policydb_offset_fallback_allowed(void)
 {
+    /*
+     * policydb 偏移不能靠 sizeof(void *) 盲猜。只有确认当前内核像已审计的
+     * 4.14 sm8150/cepheus stateful 布局，或者已经是非 legacy 的新内核时，
+     * 才允许这个兜底；否则宁可跳过高风险路径。
+     *
+     * Do not guess policydb layout on pre-baseline legacy kernels.  The old
+     * sizeof(void *) fallback is only acceptable once the runtime looks like
+     * the audited 4.14 sm8150/cepheus stateful SELinux layout or a newer
+     * non-legacy kernel.
+     */
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
 
 static bool write_op_slot_fallback_allowed(void)
 {
+    /*
+     * 参考 4.14 selinuxfs.c 可以确认 write_op[] 的 access/context 下标，
+     * 但“下标可信”和“可以安全写函数指针表”是两回事。当前 APatch/KP c02
+     * 不导出 hotpatch_nosync，所以实际写表逻辑在 install_write_op_hooks()
+     * 里禁用，只保留这个布局置信度判断和日志。
+     *
+     * SEL_CONTEXT == 5 and SEL_ACCESS == 6 are confirmed in
+     * security/selinux/selinuxfs.c for the referenced 4.14 trees.  This gate
+     * only expresses layout confidence; the actual pointer-table patch is
+     * disabled below on APatch/KP c02 because hotpatch_nosync is not exported.
+     */
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
 
 static bool security_setprocattr_has_lsm_arg(void)
 {
+    /*
+     * security/security.c:
+     *   < 5.4  security_setprocattr(name, value, size)
+     *   >=5.4  security_setprocattr(lsm, name, value, size)
+     */
     return kver >= VERSION(5, 4, 0);
 }
 
 static bool security_load_policy_has_load_state(void)
 {
+    /*
+     * 4.14 的 security_load_policy() 会直接提交 live policy，没有新版
+     * load_state/cancel 流程。只有解析到 selinux_policy_cancel 这类新版
+     * 辅助符号时，才走带 load_state 的调用；否则使用 clean blob /
+     * policydb_read 路线。
+     *
+     * The referenced 4.14 services.c commits the loaded policy directly:
+     *   security_load_policy(struct selinux_state *state, void *data, size_t len)
+     *
+     * Newer kernels grow staged load-state/cancel helpers.  Use the presence of
+     * selinux_policy_cancel()/compat as the runtime signal before calling the
+     * load_state form; otherwise fall back to clean blob / policydb_read.
+     */
     return selinux_policy_cancel_fn || selinux_policy_cancel_compat_fn;
 }
 
@@ -1923,10 +1992,33 @@ static bool context_token_matches(const char *query, const char *lit)
 static bool dirtysepolicy_context_should_hide(const char *query)
 {
     /*
-     * DirtySepolicy contextExists() probes these labels through
-     * /sys/fs/selinux/context, /sys/fs/selinux/access fallback, and finally
-     * /proc/self/attr/current.  Return -EINVAL for app-side probes so a dirty
-     * live policy does not reveal root framework labels.
+     * DirtySepolicy reference:
+     *   https://github.com/LSPosed/DirtySepolicy/tree/0cda3b89cd168c88cbf639da9e3d4f44d70c0b78
+     *
+     * Relevant source paths:
+     *   - app/src/main/java/org/lsposed/dirtysepolicy/AppZygote.java
+     *       contextExists("u:r:adbroot:s0")
+     *       contextExists("u:r:magisk:s0")
+     *       contextExists("u:object_r:magisk_file:s0")
+     *       contextExists("u:r:ksu:s0")
+     *       contextExists("u:object_r:ksu_file:s0")
+     *       contextExists("u:object_r:lsposed_file:s0")
+     *       contextExists("u:object_r:xposed_data:s0")
+     *       contextExists("u:object_r:xposed_file:s0")
+     *   - app/src/main/java/org/lsposed/dirtysepolicy/SELinux.java
+     *       contextExists() first writes /sys/fs/selinux/context.
+     *       On EINVAL it falls back to /sys/fs/selinux/access.
+     *       On EINVAL again it writes /proc/self/attr/current; EPERM is still
+     *       interpreted as "context exists".
+     *
+     * DirtySepolicy 的 contextExists() 不是只测 /sys/fs/selinux/context。
+     * 如果这里只拦 context 节点，它还会继续走 access fallback，最后再写
+     * /proc/self/attr/current；其中 EPERM 也会被它当成“上下文存在”。因此
+     * 这些敏感 context 必须在三条路径里都表现成 EINVAL/不存在。
+     *
+     * Because of that three-stage fallback, hiding a dirty context requires all
+     * three kernel paths to return an "invalid context" style result for
+     * app-side probes.
      */
     if (context_token_matches(query, "u:r:adbroot:s0"))
         return true;
@@ -2003,11 +2095,36 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     /*
      * contextExists() second stage calls /access with the same hidden context
      * as source and target.  Hide either side to keep the fallback consistent.
+     *
+     * 这是为了堵住 contextExists() 的第二段 fallback：它会拿同一个 context
+     * 当源和目标去查 /access。只要源或目标是需要隐藏的 dirty context，
+     * 这里就直接 deny。
      */
     if (dirtysepolicy_context_should_hide(src) ||
         dirtysepolicy_context_should_hide(dst))
         return true;
 
+    /*
+     * AppZygote.java DirtySepolicy access probes:
+     *   system_server -> system_server        process execmem
+     *   shell         -> su                   process transition
+     *   rootfs        -> tmpfs                filesystem associate
+     *   kernel        -> tmpfs                fifo_file open
+     *   kernel        -> adb_data_file        file read
+     *   system_server -> apk_data_file        file execute
+     *   dex2oat       -> dex2oat_exec         file execute_no_trans
+     *   zygote        -> adb_data_file        dir search
+     *
+     * SELinux.java resolves the class/permission bit separately from
+     * /sys/fs/selinux/class and then checks the returned av_decision.allowed.
+     * Matching the context pair here is enough to force the DirtySepolicy
+     * result to false while leaving policy-manager processes bypassed earlier.
+     *
+     * DirtySepolicy 会先从 /sys/fs/selinux/class 读 class/perm 编号，再向
+     * /access 写入 source context、target context 和 class id。这里按它
+     * 固定使用的 context 对拦截即可；管理进程已经在入口处 bypass，不影响
+     * APatch/magiskpolicy 自己操作策略。
+     */
     if (access_contexts_match(query, "u:r:system_server:s0", "u:r:system_server:s0"))
         return true;
     if (access_contexts_match(query, "u:r:shell:s0", "u:r:su:s0"))
@@ -2735,9 +2852,28 @@ static int install_write_op_hooks(void)
     }
 
     /*
-     * Do not patch write_op[] on KP c02.  Older KernelPatch cores do not
-     * export hotpatch_nosync, and keeping that symbol as a static import makes
-     * the KPM fail relocation before init() can log diagnostics.
+     * write_op[] fallback notes:
+     *
+     * The referenced 4.14 selinuxfs.c trees confirm:
+     *   SEL_CONTEXT == 5
+     *   SEL_ACCESS  == 6
+     *
+     * Older builds patched write_op[5]/write_op[6] with hotpatch_nosync when
+     * direct sel_write_access()/sel_write_context() symbols were missing.
+     * The APatch bugreport captured on this cepheus device shows:
+     *   KernelPatch Version: c02
+     *   KP E unknown symbol: hotpatch_nosync
+     *   KP load kpm: selinux_magisk_access_filter, rc: -2
+     *
+     * 这不是 SELinux hook 逻辑失败，而是 KPM loader 在重定位阶段就找不到
+     * hotpatch_nosync，导致 init() 都不会执行。为了让模块至少能加载并打印
+     * 诊断，本分支完全避免静态导入 hotpatch_nosync；如果 direct symbol
+     * 不存在，就记录降级原因，而不是再尝试写 write_op[]。
+     *
+     * That failure happens before module init(), so this c02-compatible build
+     * deliberately avoids importing hotpatch_nosync at all.  If direct symbols
+     * are absent, log the downgrade and keep the KPM loaded for diagnostics
+     * instead of failing relocation.
      */
     if (!write_op_slot_fallback_allowed()) {
         pr_warn("[selinux_hook] sel_write_access unresolved; skip hardcoded write_op[%d/%d] fallback because legacy route lacks 4.14 selinux_state baseline kver=%x\n",
