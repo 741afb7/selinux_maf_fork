@@ -64,6 +64,14 @@ static bool g_hook_context_compute_av_ok; // Legacy AV hook attachment status fl
 static void *g_funcs[24];
 static int g_hooks;
 struct file;
+typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
+extern unsigned long *pgtable_entry(unsigned long pgd, unsigned long va);
+static sel_write_op_fn *g_write_op_access_slot;
+static sel_write_op_fn *g_write_op_context_slot;
+static sel_write_op_fn g_orig_write_op_access;
+static sel_write_op_fn g_orig_write_op_context;
+static bool g_write_op_access_patched;
+static bool g_write_op_context_patched;
 static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
 static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t size);
 static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
@@ -492,6 +500,7 @@ static void log_bypass_once(const char *node, uid_t uid, const char *query);
 static void cancel_clean_sidtab_convert(const char *reason);
 static bool use_clean_blob_route(void);
 static bool use_legacy_clean_blob_query(void);
+static bool selinux_414_compat_path(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_compat_call_needed(void);
 static bool policydb_offset_fallback_allowed(void);
@@ -533,6 +542,8 @@ static bool current_status_read_scope_patched(void);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
+static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size);
+static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size);
 static int install_write_op_hooks(void);
 static void uninstall_write_op_hooks(void);
 static void uninstall_inline_hooks(void);
@@ -763,6 +774,11 @@ static bool use_legacy_clean_blob_query(void)
     return kver < SELINUX_LEGACY_BLOB_QUERY_MAX;
 }
 
+static bool selinux_414_compat_path(void)
+{
+    return kver < VERSION(4, 15, 0);
+}
+
 static bool clean_policydb_redirect_supported(void)
 {
     /*
@@ -864,17 +880,11 @@ static bool policydb_offset_fallback_allowed(void)
 static bool write_op_slot_fallback_allowed(void)
 {
     /*
-     * 参考 4.14 selinuxfs.c 可以确认 write_op[] 的 access/context 下标，
-     * 但“下标可信”和“可以安全写函数指针表”是两回事。当前 APatch/KP c02
-     * 不导出 hotpatch_nosync，所以实际写表逻辑在 install_write_op_hooks()
-     * 里禁用，只保留这个布局置信度判断和日志。
-     *
-     * SEL_CONTEXT == 5 and SEL_ACCESS == 6 are confirmed in
-     * security/selinux/selinuxfs.c for the referenced 4.14 trees.  This gate
-     * only expresses layout confidence; the actual pointer-table patch is
-     * disabled below on APatch/KP c02 because hotpatch_nosync is not exported.
+     * Keep the c02-compatible 4.14 behavior from the last commit: do not patch
+     * write_op[] on 4.14-or-older kernels.  For newer kernels, preserve the
+     * pre-merge fallback when sel_write_access() is not directly resolvable.
      */
-    return !use_legacy_clean_blob_query() || g_selinux_state;
+    return !selinux_414_compat_path();
 }
 
 static bool security_setprocattr_has_lsm_arg(void)
@@ -969,12 +979,16 @@ static bool g_symbol_cache_resolved;
 
 static size_t str_len_safe(const char *s)
 {
+    const volatile char *p;
     size_t len = 0;
 
     if (!s)
         return 0;
 
-    while (s[len])
+    /* Keep this as an explicit byte walk so clang/gcc does not fold it into an
+     * out-of-line strlen() libcall, which is unavailable in the KPM loader. */
+    p = (const volatile char *)s;
+    while (p[len])
         len++;
     return len;
 }
@@ -2000,6 +2014,9 @@ static bool context_token_matches(const char *query, const char *lit)
 
 static bool dirtysepolicy_context_should_hide(const char *query)
 {
+    if (!selinux_414_compat_path())
+        return false;
+
     /*
      * DirtySepolicy reference:
      *   https://github.com/LSPosed/DirtySepolicy/tree/0cda3b89cd168c88cbf639da9e3d4f44d70c0b78
@@ -2095,6 +2112,8 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     const char *src;
     const char *dst;
 
+    if (!selinux_414_compat_path())
+        return false;
     if (!query || !len)
         return false;
 
@@ -2831,10 +2850,154 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
                      probe->query);
 }
 
+#define SELINUX_PTE_VALID (1UL << 0)
+#define SELINUX_PTE_TABLE_BIT (1UL << 1)
+#define SELINUX_PTE_RDONLY (1UL << 7)
+#define SELINUX_PTE_DBM (1UL << 51)
+#define SELINUX_PTE_CONT (1UL << 52)
+#define SELINUX_CONT_PTES 16
+
+static unsigned long selinux_tlbi_vaddr(unsigned long addr)
+{
+    unsigned long v = addr >> 12;
+
+    v &= ((1UL << 44) - 1);
+    return v;
+}
+
+static void selinux_flush_tlb_kernel_page(unsigned long addr)
+{
+    addr = selinux_tlbi_vaddr(addr);
+    asm volatile("dsb ishst\n"
+                 "tlbi vaale1is, %0\n"
+                 "dsb ish\n"
+                 "isb\n"
+                 :
+                 : "r"(addr)
+                 : "memory");
+}
+
+static bool selinux_pte_valid_cont(unsigned long pte)
+{
+    return (pte & (SELINUX_PTE_VALID | SELINUX_PTE_TABLE_BIT | SELINUX_PTE_CONT)) ==
+           (SELINUX_PTE_VALID | SELINUX_PTE_TABLE_BIT | SELINUX_PTE_CONT);
+}
+
+static void *lookup_kernel_pgd(void)
+{
+    void *pgd;
+
+    pgd = lookup_name_optional_suffix("swapper_pg_dir");
+    if (!pgd)
+        pgd = lookup_name_optional_suffix("init_pg_dir");
+    return pgd;
+}
+
+static int patch_kernel_ulong(void *addr, unsigned long value)
+{
+    unsigned long saved[SELINUX_CONT_PTES];
+    unsigned long *pgd;
+    unsigned long *pte;
+    unsigned long *base;
+    int count;
+    int i;
+
+    if (!addr)
+        return -EINVAL;
+
+    pgd = (unsigned long *)lookup_kernel_pgd();
+    if (!pgd)
+        return -ENOENT;
+
+    pte = pgtable_entry((unsigned long)pgd, (unsigned long)addr);
+    if (!pte)
+        return -EFAULT;
+
+    if (!READ_ONCE(*pte))
+        return -EFAULT;
+
+    if (selinux_pte_valid_cont(READ_ONCE(*pte))) {
+        base = (unsigned long *)((unsigned long)pte & ~(sizeof(*pte) * SELINUX_CONT_PTES - 1));
+        count = SELINUX_CONT_PTES;
+    } else {
+        base = pte;
+        count = 1;
+    }
+
+    for (i = 0; i < count; i++) {
+        saved[i] = READ_ONCE(base[i]);
+        WRITE_ONCE(base[i], (saved[i] | SELINUX_PTE_DBM) & ~SELINUX_PTE_RDONLY);
+    }
+    selinux_flush_tlb_kernel_page((unsigned long)addr);
+
+    WRITE_ONCE(*(unsigned long *)addr, value);
+
+    for (i = 0; i < count; i++)
+        WRITE_ONCE(base[i], saved[i]);
+    selinux_flush_tlb_kernel_page((unsigned long)addr);
+
+    return 0;
+}
+
+static int hotpatch_write_op_slot(sel_write_op_fn *slot, sel_write_op_fn value,
+                                  sel_write_op_fn *old_value)
+{
+    unsigned long old_raw;
+    unsigned long new_raw;
+
+    if (!slot || !value)
+        return -EINVAL;
+
+    old_raw = (unsigned long)READ_ONCE(*slot);
+    new_raw = (unsigned long)value;
+    if (old_value)
+        *old_value = (sel_write_op_fn)old_raw;
+
+    return patch_kernel_ulong(slot, new_raw);
+}
+
+static ssize_t run_sel_write_op_filter(const char *node, sel_write_op_fn origin,
+                                       void (*before)(hook_fargs4_t *a, void *u),
+                                       struct file *file, char *buf, size_t size)
+{
+    hook_fargs4_t a;
+
+    zero_bytes(&a, sizeof(a));
+    a.arg0 = (uint64_t)file;
+    a.arg1 = (uint64_t)buf;
+    a.arg2 = (uint64_t)size;
+
+    before(&a, NULL);
+    if (!a.skip_origin) {
+        if (!origin) {
+            pr_warn("[selinux_hook] missing original write_op for %s\n", node ?: "?");
+            a.ret = -EINVAL;
+        } else {
+            a.ret = (uint64_t)origin((struct file *)a.arg0, (char *)a.arg1, (size_t)a.arg2);
+        }
+    }
+    after_sel_write_common(&a, NULL);
+
+    return (ssize_t)a.ret;
+}
+
+static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size)
+{
+    return run_sel_write_op_filter("access", g_orig_write_op_access,
+                                   before_sel_write_access, file, buf, size);
+}
+
+static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size)
+{
+    return run_sel_write_op_filter("context", g_orig_write_op_context,
+                                   before_sel_write_context, file, buf, size);
+}
+
 static int install_write_op_hooks(void)
 {
     unsigned long addr_access, addr_context;
-    void *write_op;
+    sel_write_op_fn *write_op;
+    int rc;
 
     /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
     addr_access = (unsigned long)lookup_name_optional_suffix("sel_write_access");
@@ -2885,26 +3048,74 @@ static int install_write_op_hooks(void)
      * instead of failing relocation.
      */
     if (!write_op_slot_fallback_allowed()) {
-        pr_warn("[selinux_hook] sel_write_access unresolved; skip hardcoded write_op[%d/%d] fallback because legacy route lacks 4.14 selinux_state baseline kver=%x\n",
+        pr_warn("[selinux_hook] sel_write_access unresolved; keep 4.14 compatibility path and skip write_op[%d/%d] fallback kver=%x\n",
                 SEL_WRITE_OP_CONTEXT, SEL_WRITE_OP_ACCESS, kver);
         return 0;
     }
 
-    write_op = lookup_name_optional_suffix("write_op");
+    write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
     log_symbol_addr("write_op", write_op);
     if (!write_op) {
-        pr_warn("[selinux_hook] sel_write_access unresolved and write_op missing; access/context hooks skipped\n");
-        return 0;
+        pr_err("[selinux_hook] cannot find sel_write_access or write_op\n");
+        return -ENOENT;
     }
 
-    pr_warn("[selinux_hook] write_op[%d/%d] fallback unavailable on this KP core because hotpatch_nosync is not exported; direct sel_write_access hook is required\n",
-            SEL_WRITE_OP_CONTEXT, SEL_WRITE_OP_ACCESS);
+    g_write_op_context_slot = &write_op[SEL_WRITE_OP_CONTEXT];
+    g_write_op_access_slot = &write_op[SEL_WRITE_OP_ACCESS];
+
+    if (!READ_ONCE(*g_write_op_access_slot)) {
+        pr_err("[selinux_hook] write_op access slot is empty\n");
+        return -ENOENT;
+    }
+
+    rc = hotpatch_write_op_slot(g_write_op_access_slot, hooked_sel_write_access,
+                                &g_orig_write_op_access);
+    if (rc) {
+        pr_err("[selinux_hook] patch write_op access failed rc=%d\n", rc);
+        return rc;
+    }
+    g_write_op_access_patched = true;
+
+    if (READ_ONCE(*g_write_op_context_slot)) {
+        rc = hotpatch_write_op_slot(g_write_op_context_slot, hooked_sel_write_context,
+                                    &g_orig_write_op_context);
+        if (rc) {
+            pr_err("[selinux_hook] patch write_op context failed rc=%d\n", rc);
+            uninstall_write_op_hooks();
+            return rc;
+        }
+        g_write_op_context_patched = true;
+    } else {
+        pr_warn("[selinux_hook] write_op context slot is empty\n");
+    }
+
+    selinux_hook_dbg("[selinux_hook] write_op hooks installed access=%px->%px context=%px->%px\n",
+                     g_orig_write_op_access, hooked_sel_write_access,
+                     g_orig_write_op_context, hooked_sel_write_context);
     return 0;
 }
 
 static void uninstall_write_op_hooks(void)
 {
-    /* No write_op[] slots are modified on KP c02-compatible builds. */
+    int rc;
+
+    if (g_write_op_context_patched && g_write_op_context_slot && g_orig_write_op_context) {
+        rc = hotpatch_write_op_slot(g_write_op_context_slot, g_orig_write_op_context, NULL);
+        if (rc)
+            pr_warn("[selinux_hook] restore write_op context failed rc=%d\n", rc);
+    }
+    g_write_op_context_patched = false;
+    g_write_op_context_slot = NULL;
+    g_orig_write_op_context = NULL;
+
+    if (g_write_op_access_patched && g_write_op_access_slot && g_orig_write_op_access) {
+        rc = hotpatch_write_op_slot(g_write_op_access_slot, g_orig_write_op_access, NULL);
+        if (rc)
+            pr_warn("[selinux_hook] restore write_op access failed rc=%d\n", rc);
+    }
+    g_write_op_access_patched = false;
+    g_write_op_access_slot = NULL;
+    g_orig_write_op_access = NULL;
 }
 
 static void uninstall_inline_hooks(void)
