@@ -4361,6 +4361,10 @@ static sel_hook_state_t module_get_working_mode(void) // Used to identify the wo
         !legacy_av_disabled)
         return SEL_HOOK_STATE_NORMAL_M;
 
+	//4.9 -> FULL
+	if (selinux_49_compat_path())
+		return SEL_HOOK_STATE_FULL_FALLBACK;
+
     // PARTIAL
     if (has_clean_blob || has_clean_policydb)
         return SEL_HOOK_STATE_PARTIAL_FALLBACK;
