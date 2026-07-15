@@ -754,17 +754,12 @@ static bool should_bypass_clean_filter(uid_t uid)
     if (uid < 10000)
         return true;
 
-    /*
-     * Let the policy management path see and write the live policy.  Otherwise
-     * magiskpolicy/apd may read the clean snapshot as its baseline and lose
-     * rules it is trying to install.
-     */
-    return current_is_policy_manager();
+    return false;
 }
 
 static bool should_log_live_bypass(uid_t uid)
 {
-    return uid >= 10000 || current_is_policy_manager();
+    return uid >= 10000;
 }
 
 static bool use_clean_blob_route(void)
@@ -821,18 +816,6 @@ static bool clean_policydb_redirect_supported(void)
      * path.  Kernels older than this baseline stay on the pure legacy route.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
-}
-
-static bool current_is_policy_manager(void)
-{
-    const char *comm = current_comm();
-
-    if (str_eq_lit(comm, "magiskpolicy") ||
-        str_eq_lit(comm, "apd") ||
-        str_eq_lit(comm, "truncate"))
-        return true;
-
-    return false;
 }
 
 static u32 *bypass_counter_for_node(const char *node)
@@ -2649,8 +2632,8 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     if (!clean_policydb_redirect_supported())
         return;
 
-    if (READ_ONCE(g_internal_policy_load_depth) ||   // 模块内部加载
-        current_is_policy_manager()) {                // magiskpolicy 等
+    if (READ_ONCE(g_internal_policy_load_depth) || bypass) //模块内部加载 或 UID < 10000
+	{
         return;  // 完全跳过，使用原始 policydb
     }
     
@@ -2740,7 +2723,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
     struct extended_perms *xperms;
     struct av_decision clean_avd;
 
-    if (READ_ONCE(g_internal_policy_load_depth) || current_is_policy_manager())
+    if (READ_ONCE(g_internal_policy_load_depth) || should_bypass_clean_filter(current_uid()))
         return;
 
     clean_pdb = (struct policydb *)READ_ONCE(g_clean_policydb);
@@ -3417,9 +3400,11 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
      * avoid clean policydb helpers with device-specific ABI; only block known
      * DirtySepolicy probes while allowing manager/root callers through.
      */
+	 
+	uid = current_uid();
+	manager = should_bypass_clean_filter(uid);
+	 
     if (selinux_49_compat_path()) {
-        uid = current_uid();
-        manager = (uid < 10000) || current_is_policy_manager();
         if (!manager && (dirtysepolicy_context_should_hide(sample) ||
                          legacy_should_block_access_query(sample, sample_len)))
             clean_ret = -EINVAL;
@@ -3434,7 +3419,6 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
         return blocked;
     }
 	
-    manager = current_is_policy_manager();
     if (!manager) {
         if (dirtysepolicy_context_should_hide(sample)) {
             clean_checked = true;
@@ -3903,11 +3887,11 @@ static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data
 
     if (!snapshot || !len || !out_data || !out_len)
         return;
-    if (current_is_policy_manager()) {
-        if (should_log_live_bypass(current_uid()))
-            log_bypass_once("policy", current_uid(), NULL);
-        return;
-    }
+    if (should_bypass_clean_filter(current_uid()))
+	{
+		log_bypass_once("policy", current_uid(), NULL);
+		return;
+	}
 
     if (!vmalloc_fn) {
         pr_warn("[selinux_hook] CLEAN policy read copy disabled: vmalloc unavailable\n");
