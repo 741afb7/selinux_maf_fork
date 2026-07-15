@@ -25,7 +25,7 @@
 #include <kputils.h>
 
 KPM_NAME("selinux_MAF_fork");
-KPM_VERSION("1.1.2");
+KPM_VERSION("1.1.3");
 KPM_LICENSE("GPL v3");
 KPM_AUTHOR("Admire, 741afb7");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
