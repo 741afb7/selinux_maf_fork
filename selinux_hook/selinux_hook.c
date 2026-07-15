@@ -1132,6 +1132,29 @@ static void resolve_required_symbols_once(void)
         on_each_symbol(cache_symbol_cb_nomod, NULL);
     }
 
+	for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (g_symbol_cache[i].addr) {
+            found++;
+            if (g_symbol_cache[i].suffixed)
+                suffixed++;
+        }
+    }
+
+    if (found == 0 && kallsyms_on_each_symbol) {
+        pr_warn("[selinux_hook] kallsyms_on_each_symbol returned no symbols, falling back to kallsyms_lookup_name\n");
+        for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+            unsigned long addr;
+            addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
+            if (addr) {
+                g_symbol_cache[i].addr = addr;
+                g_symbol_cache[i].exact = true;
+            }
+        }
+    }
+
+    found = 0;
+    suffixed = 0;
+    missing = 0;
     for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
         if (g_symbol_cache[i].addr) {
             found++;
@@ -1165,6 +1188,7 @@ static struct symbol_cache_entry *find_cached_symbol(const char *base)
 static void *lookup_name_optional_suffix(const char *base)
 {
     struct symbol_cache_entry *entry;
+	unsigned long addr;
 
     if (!base)
         return NULL;
@@ -1172,10 +1196,79 @@ static void *lookup_name_optional_suffix(const char *base)
     resolve_required_symbols_once();
 
     entry = find_cached_symbol(base);
-    if (entry)
+    if (entry && entry->addr)
         return (void *)entry->addr;
 
-    return (void *)kallsyms_lookup_name(base);
+    addr = (unsigned long)kallsyms_lookup_name(base);
+    if (addr) {
+        if (entry) {
+            entry->addr = addr;
+            entry->exact = true;
+            entry->suffixed = false;
+        }
+        return (void *)addr;
+    }
+
+    return NULL;
+}
+
+/*
+ * Some LTO kernels expose context_struct_compute_av only as a numbered local
+ * symbol (for example context_struct_compute_av.72).  Keep this expensive
+ * fallback out of the generic lookup path: when kallsyms_on_each_symbol is
+ * unusable, probing 256 names for every missing cache entry can stall the
+ * synchronous pre-kernel-init KPM loader.
+ */
+static void *lookup_name_numbered_suffix(const char *base)
+{
+    struct symbol_cache_entry *entry;
+    unsigned long addr;
+    char name[64];
+    volatile char *name_bytes = (volatile char *)name;
+    const volatile char *base_bytes = (const volatile char *)base;
+    size_t base_len;
+    size_t i;
+    size_t pos;
+    u32 n;
+
+    if (!base)
+        return NULL;
+
+    base_len = str_len_safe(base);
+    /* Dot, up to three decimal digits, and the trailing NUL. */
+    if (!base_len || base_len + 5 > sizeof(name))
+        return NULL;
+
+    /* Volatile byte copies keep clang from lowering this into an unresolved
+     * out-of-line memcpy() call in the freestanding KPM image. */
+    for (i = 0; i < base_len; i++)
+        name_bytes[i] = base_bytes[i];
+
+    for (n = 0; n < 256; n++) {
+        pos = base_len;
+        name[pos++] = '.';
+        if (n >= 100)
+            name[pos++] = '0' + (n / 100) % 10;
+        if (n >= 10)
+            name[pos++] = '0' + (n / 10) % 10;
+        name[pos++] = '0' + n % 10;
+        name[pos] = '\0';
+
+        addr = (unsigned long)kallsyms_lookup_name(name);
+        if (addr) {
+            entry = find_cached_symbol(base);
+            if (entry) {
+                entry->addr = addr;
+                entry->exact = false;
+                entry->suffixed = true;
+            }
+            pr_info("[selinux_hook] resolved %s as %s addr=%px\n",
+                    base, name, (void *)addr);
+            return (void *)addr;
+        }
+    }
+
+    return NULL;
 }
 
 static void log_symbol_addr(const char *name, const void *addr)
@@ -3936,6 +4029,8 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("context_struct_compute_av");
+	if (!addr)
+		addr = (unsigned long)lookup_name_numbered_suffix("context_struct_compute_av");
     if (addr) {
         if (clean_policydb_redirect_supported()) {
             g_funcs[g_hooks++] = (void *)addr;
