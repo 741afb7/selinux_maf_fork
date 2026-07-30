@@ -2817,7 +2817,6 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
         selinux_hook_dbg("[selinux_hook] SELinux ready inferred from legacy context_struct_compute_av\n");
     }
 
-    snapshot_clean_policy("legacy_compute_av");
 }
 
 /* Hook: /sys/fs/selinux/access write handler */
