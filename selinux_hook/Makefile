@@ -25,8 +25,19 @@ else ifdef NDK_PATH
     OBJCOPY := $(NDK_PATH)/llvm-objcopy
 endif
 
-CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -fno-common
-CFLAGS += -fno-builtin-strlen -fno-builtin-memcpy -fno-exceptions
+CFLAGS = -Wall -O0 \
+    -ffreestanding \
+    -fno-inline \
+    -fno-builtin \
+    -fno-strict-aliasing \
+    -fno-PIC \
+    -fno-pie \
+    -fno-asynchronous-unwind-tables \
+    -fno-unwind-tables \
+    -fno-stack-protector \
+    -fno-common \
+    -fno-exceptions
+
 CFLAGS += -DSELINUX_VERSION=\"$(SELINUX_VERSION)\"
 CFLAGS += -std=gnu99
 
