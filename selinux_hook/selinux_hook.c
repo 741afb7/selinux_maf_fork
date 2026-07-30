@@ -74,6 +74,7 @@ static sel_write_op_fn g_orig_write_op_access;
 static sel_write_op_fn g_orig_write_op_context;
 static bool g_write_op_access_patched;
 static bool g_write_op_context_patched;
+static bool g_write_op_install_deferred;
 static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
 static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t size);
 static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
@@ -550,6 +551,8 @@ static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t siz
 static int install_write_op_hooks(void);
 static void uninstall_write_op_hooks(void);
 static void uninstall_inline_hooks(void);
+static bool event_is_post_init(const char *event);
+static void try_complete_deferred_write_op_install(const char *reason);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
@@ -2606,6 +2609,7 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
     WRITE_ONCE(g_selinux_ready, true);
     selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
     snapshot_clean_policy("complete_init");
+	try_complete_deferred_write_op_install("complete_init");
 }
 
 /* Hook: selinux_policy_commit */
@@ -2621,6 +2625,66 @@ static void after_selinux_policy_commit(hook_fargs1_t *a, void *u)
     selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policy=%px first policydb=%px clean policydb=%px\n",
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
+	try_complete_deferred_write_op_install("policy_commit");
+}
+
+/*
+ * Determine whether the current KP event is past the pre-kernel-init stage.
+ * sel_write_access / sel_write_context inline hooks must NOT be installed
+ * during pre-kernel-init: the kernel's selinux_complete_init() will re-patch
+ * write_op[] afterwards and overwrite/corrupt our hook pointers, which on
+ * v1.1.4 led to execve -> ext4_lookup -> blk_mq pointer corruption Oops
+ * (and on MTK platforms manifests as display freeze / panic on SELinux
+ * access).  We defer installation until SELinux is ready.
+ */
+static bool event_is_post_init(const char *event)
+{
+    const char * const pre = "pre-kernel-init";
+    const char *p = pre;
+
+    if (!event)
+        return true;
+    /*
+     * Compare byte-by-byte against "pre-kernel-init" without invoking the
+     * out-of-line strcmp() libcall, which is unavailable in the KPM loader.
+     */
+    while (*p && *event && *p == *event) {
+        p++;
+        event++;
+    }
+    if (*p == '\0' && *event == '\0')
+        return false;
+    return true;
+}
+
+/*
+ * Complete a previously deferred install_write_op_hooks() now that SELinux
+ * is ready.  Idempotent: install_write_op_hooks() itself is guarded by
+ * g_write_op_access_patched / g_write_op_context_patched, so repeated calls
+ * (after_selinux_policy_commit fires multiple times during boot) are no-ops
+ * after the first successful install.
+ */
+static void try_complete_deferred_write_op_install(const char *reason)
+{
+    int rc;
+
+    if (!READ_ONCE(g_write_op_install_deferred))
+        return;
+    if (READ_ONCE(g_write_op_access_patched) ||
+        READ_ONCE(g_write_op_context_patched))
+        return;
+
+    WRITE_ONCE(g_write_op_install_deferred, false);
+    rc = install_write_op_hooks();
+    if (rc) {
+        /* Restore the deferred flag so a later policy_commit can retry. */
+        WRITE_ONCE(g_write_op_install_deferred, true);
+        pr_warn("[selinux_hook] deferred install_write_op_hooks failed reason=%s rc=%d\n",
+                reason ? reason : "(null)", rc);
+        return;
+    }
+    pr_info("[selinux_hook] deferred install_write_op_hooks completed reason=%s\n",
+            reason ? reason : "(null)");
 }
 
 static void before_policydb_arg0(hook_fargs6_t *a, void *u)
@@ -4207,10 +4271,16 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
     }
 
-    rc = install_write_op_hooks();
-    if (rc) {
-        uninstall_inline_hooks();
-        return rc;
+    if (event_is_post_init(event) || READ_ONCE(g_selinux_ready)) {
+        rc = install_write_op_hooks();
+        if (rc) {
+            uninstall_inline_hooks();
+            return rc;
+        }
+    } else {
+        pr_info("[selinux_hook] deferring install_write_op_hooks until SELinux ready (event=%s)\n",
+                event ? event : "(null)");
+        WRITE_ONCE(g_write_op_install_deferred, true);
     }
 
     /*
@@ -4286,6 +4356,7 @@ static long init(const char *args, const char *event, void *__user r)
 
 static long exit_(void *__user r)
 {
+    WRITE_ONCE(g_write_op_install_deferred, false);
     uninstall_write_op_hooks();
     uninstall_inline_hooks();
     g_policy_capture_in_progress = false;
