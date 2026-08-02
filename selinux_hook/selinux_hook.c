@@ -429,14 +429,6 @@ static u32 g_clean_eval_depth;
 static u32 g_bypass_access_log_count;
 static u32 g_bypass_context_log_count;
 
-/* Cached vmalloc copy of g_clean_policy_blob shared by every reader.
- * Snapshot runs once at module init, so the source pointer is effectively
- * immutable — the cache is reused on every hit and only re-vmalloc'd when
- * the source pointer changes.  Guarded by g_policy_cache_lock. */
-static void *g_policy_read_cache;
-static size_t g_policy_read_cache_len;
-static void *g_policy_read_cache_src;
-static raw_spinlock_t g_policy_cache_lock = { .raw_lock = ATOMIC_INIT(0) };
 static u32 g_bypass_policy_log_count;
 static u32 g_internal_policy_load_depth;
 static u32 g_procattr_current_count;
@@ -506,6 +498,7 @@ static bool use_legacy_clean_blob_query(void);
 static bool selinux_49_compat_path(void);
 static bool selinux_414_compat_path(void);
 static bool clean_policydb_redirect_supported(void);
+static bool selinux_state_arg_required(void);
 static bool selinux_compat_call_needed(void);
 static bool policydb_offset_fallback_allowed(void);
 static bool write_op_slot_fallback_allowed(void);
@@ -629,8 +622,8 @@ static ssize_t patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
 static void copy_bytes(void *dst, const void *src, size_t len)
 {
     size_t i;
-    char *d = (char *)dst;
-    const char *s = (const char *)src;
+    volatile char *d = (volatile char *)dst;
+    const volatile char *s = (const volatile char *)src;
 
     if (!d || !s)
         return;
@@ -858,7 +851,12 @@ static bool selinux_compat_call_needed(void)
      * common stateful era, and stop before the newer 6.4+ LSM refactors where
      * this KPM has not been audited.
      */
-	return g_selinux_state && kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
+	return g_selinux_state && selinux_state_arg_required();
+}
+
+static bool selinux_state_arg_required(void)
+{
+    return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
 }
 
 static bool policydb_offset_fallback_allowed(void)
@@ -975,6 +973,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
 #define SYMBOL_CACHE_COUNT (sizeof(g_symbol_cache) / sizeof(g_symbol_cache[0]))
 
 static bool g_symbol_cache_resolved;
+static bool g_symbol_cache_walk_complete;
 
 static size_t str_len_safe(const char *s)
 {
@@ -1105,6 +1104,8 @@ static void resolve_required_symbols_once(void)
     u32 found = 0;
     u32 suffixed = 0;
     u32 missing = 0;
+    int walk_rc = -ENOENT;
+    bool walk_complete = false;
 
     if (READ_ONCE(g_symbol_cache_resolved))
         return;
@@ -1123,12 +1124,12 @@ static void resolve_required_symbols_once(void)
             }
         }
     } else if (kver <= VERSION(6, 1, 0)) {
-        kallsyms_on_each_symbol(cache_symbol_cb, NULL);
+        walk_rc = kallsyms_on_each_symbol(cache_symbol_cb, NULL);
     } else {
         kallsyms_on_each_symbol_nomod_fn on_each_symbol;
 
         on_each_symbol = (kallsyms_on_each_symbol_nomod_fn)kallsyms_on_each_symbol;
-        on_each_symbol(cache_symbol_cb_nomod, NULL);
+        walk_rc = on_each_symbol(cache_symbol_cb_nomod, NULL);
     }
 
 	for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
@@ -1138,6 +1139,7 @@ static void resolve_required_symbols_once(void)
                 suffixed++;
         }
     }
+    walk_complete = walk_rc == 0 && found > 0;
 
     if (found == 0 && kallsyms_on_each_symbol) {
         pr_warn("[selinux_hook] kallsyms_on_each_symbol returned no symbols, falling back to kallsyms_lookup_name\n");
@@ -1164,6 +1166,7 @@ static void resolve_required_symbols_once(void)
         }
     }
 
+    WRITE_ONCE(g_symbol_cache_walk_complete, walk_complete);
     WRITE_ONCE(g_symbol_cache_resolved, true);
     pr_info("[selinux_hook] symbol cache resolved in one pass: found=%u suffixed=%u missing=%u\n",
             found, suffixed, missing);
@@ -1187,7 +1190,6 @@ static struct symbol_cache_entry *find_cached_symbol(const char *base)
 static void *lookup_name_optional_suffix(const char *base)
 {
     struct symbol_cache_entry *entry;
-	unsigned long addr;
 
     if (!base)
         return NULL;
@@ -1195,20 +1197,10 @@ static void *lookup_name_optional_suffix(const char *base)
     resolve_required_symbols_once();
 
     entry = find_cached_symbol(base);
-    if (entry && entry->addr)
+    if (entry)
         return (void *)entry->addr;
 
-    addr = (unsigned long)kallsyms_lookup_name(base);
-    if (addr) {
-        if (entry) {
-            entry->addr = addr;
-            entry->exact = true;
-            entry->suffixed = false;
-        }
-        return (void *)addr;
-    }
-
-    return NULL;
+    return (void *)kallsyms_lookup_name(base);
 }
 
 /*
@@ -1231,6 +1223,11 @@ static void *lookup_name_numbered_suffix(const char *base)
     u32 n;
 
     if (!base)
+        return NULL;
+
+    resolve_required_symbols_once();
+
+    if (READ_ONCE(g_symbol_cache_walk_complete))
         return NULL;
 
     base_len = str_len_safe(base);
@@ -1280,8 +1277,12 @@ static int call_security_load_policy(void *data, size_t len, struct selinux_load
 {
     if (!security_load_policy_has_load_state())
         return -EOPNOTSUPP;
-    if (selinux_compat_call_needed() && security_load_policy_compat_fn)
-        return security_load_policy_compat_fn(g_selinux_state, data, len, load_state);
+    if (selinux_state_arg_required()) {
+        if (!g_selinux_state || !security_load_policy_compat_fn)
+            return -ENOENT;
+        return security_load_policy_compat_fn(g_selinux_state, data, len,
+                                              load_state);
+    }
     if (security_load_policy_fn)
         return security_load_policy_fn(data, len, load_state);
     return -ENOENT;
@@ -1289,7 +1290,9 @@ static int call_security_load_policy(void *data, size_t len, struct selinux_load
 
 static void call_selinux_policy_cancel(struct selinux_load_state *load_state)
 {
-    if (selinux_compat_call_needed() && selinux_policy_cancel_compat_fn) {
+    if (selinux_state_arg_required()) {
+        if (!g_selinux_state || !selinux_policy_cancel_compat_fn)
+            return;
         selinux_policy_cancel_compat_fn(g_selinux_state, load_state);
         return;
     }
@@ -1299,8 +1302,12 @@ static void call_selinux_policy_cancel(struct selinux_load_state *load_state)
 
 static int call_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp)
 {
-    if (selinux_compat_call_needed() && security_context_to_sid_compat_fn)
-        return security_context_to_sid_compat_fn(g_selinux_state, scontext, scontext_len, out_sid, gfp);
+    if (selinux_state_arg_required()) {
+        if (!g_selinux_state || !security_context_to_sid_compat_fn)
+            return -ENOENT;
+        return security_context_to_sid_compat_fn(g_selinux_state, scontext,
+                                                 scontext_len, out_sid, gfp);
+    }
     if (security_context_to_sid_fn)
         return security_context_to_sid_fn(scontext, scontext_len, out_sid, gfp);
     return -ENOENT;
@@ -2613,9 +2620,11 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
 }
 
 /* Hook: selinux_policy_commit */
-static void after_selinux_policy_commit(hook_fargs1_t *a, void *u)
+static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
 {
-    void *policy = read_load_state_policy((void *)a->arg0);
+    void *load_state = selinux_state_arg_required() ? (void *)a->arg1
+                                                    : (void *)a->arg0;
+    void *policy = read_load_state_policy(load_state);
 
     WRITE_ONCE(g_selinux_ready, true);
     if (policy && !READ_ONCE(g_first_policy))
@@ -2630,10 +2639,10 @@ static void after_selinux_policy_commit(hook_fargs1_t *a, void *u)
 
 /*
  * Determine whether the current KP event is past the pre-kernel-init stage.
- * sel_write_access / sel_write_context inline hooks must NOT be installed
+ * sel_write_access / sel_write_context hooks must NOT be installed
  * during pre-kernel-init: the kernel's selinux_complete_init() will re-patch
  * write_op[] afterwards and overwrite/corrupt our hook pointers, which on
- * v1.1.4 led to execve -> ext4_lookup -> blk_mq pointer corruption Oops
+ * fork-1.1.3 led to execve -> ext4_lookup -> blk_mq pointer corruption Oops
  * (and on MTK platforms manifests as display freeze / panic on SELinux
  * access).  We defer installation until SELinux is ready.
  */
@@ -3961,40 +3970,13 @@ static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data
         return;
     }
 
-    /* Cache hit: a previous reader already vfree'd-into-cache for this
-     * exact source pointer.  Reuse the cached vmalloc buffer — no fresh
-     * allocation, no leak. */
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_policy_cache_lock);
-    if (g_policy_read_cache && g_policy_read_cache_src == snapshot &&
-        g_policy_read_cache_len == len) {
-        copy = g_policy_read_cache;
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_policy_cache_lock);
-    } else {
-        void *stale = g_policy_read_cache;
-
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_policy_cache_lock);
-
-        copy = vmalloc_fn(len);
-        if (!copy) {
-            pr_warn("[selinux_hook] CLEAN policy read copy alloc failed len=%zu\n", len);
-            return;
-        }
-        copy_bytes(copy, snapshot, len);
-
-        if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_policy_cache_lock);
-        g_policy_read_cache = copy;
-        g_policy_read_cache_len = len;
-        g_policy_read_cache_src = snapshot;
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_policy_cache_lock);
-
-        if (stale && vfree_fn)
-            vfree_fn(stale);
+    copy = vmalloc_fn(len);
+    if (!copy) {
+        pr_warn("[selinux_hook] CLEAN policy read copy alloc failed len=%zu; fallback=live\n",
+                len);
+        return;
     }
+    copy_bytes(copy, snapshot, len);
 
     *out_data = copy;
     *out_len = len;
@@ -4153,11 +4135,11 @@ static long init(const char *args, const char *event, void *__user r)
     if (security_read_policy_fn) {
         /* Non-4.9 only / 仅非 4.9：4.9 不进入 g_hooks++，避免按错误 ABI hook。 */
         if (!selinux_49_compat_path()) {
-            int argc = selinux_compat_call_needed() ? 3 : 2;
+            int argc = selinux_state_arg_required() ? 3 : 2;
 
             g_funcs[g_hooks++] = (void *)security_read_policy_fn;
             pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
-            if (selinux_compat_call_needed())
+            if (selinux_state_arg_required())
                 hook_wrap((void *)security_read_policy_fn, 3, before_security_read_policy_compat, NULL, NULL);
             else
                 hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
@@ -4341,9 +4323,12 @@ static long init(const char *args, const char *event, void *__user r)
         if (selinux_49_compat_path()) {
             pr_info("[selinux_hook] skip selinux_policy_commit on 4.9: helper ABI is device-specific\n");
         } else {
+            int argc = selinux_state_arg_required() ? 2 : 1;
+
             g_funcs[g_hooks++] = (void *)addr;
-            pr_info("[selinux_hook] hook selinux_policy_commit argc=1\n");
-            hook_wrap((void *)addr, 1, NULL, after_selinux_policy_commit, NULL);
+            pr_info("[selinux_hook] hook selinux_policy_commit argc=%d mode=%s\n",
+                    argc, selinux_state_arg_required() ? "state+load_state" : "load_state");
+            hook_wrap((void *)addr, argc, NULL, after_selinux_policy_commit, NULL);
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_policy_commit\n");
@@ -4383,14 +4368,6 @@ static long exit_(void *__user r)
             vfree_fn(g_clean_policy_blob);
         g_clean_policy_blob = NULL;
         g_clean_policy_len = 0;
-    }
-
-    if (g_policy_read_cache) {
-        if (vfree_fn)
-            vfree_fn(g_policy_read_cache);
-        g_policy_read_cache = NULL;
-        g_policy_read_cache_len = 0;
-        g_policy_read_cache_src = NULL;
     }
 
     selinux_hook_dbg("[selinux_hook] exited\n");
