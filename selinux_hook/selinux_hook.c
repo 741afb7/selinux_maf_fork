@@ -402,8 +402,6 @@ static void (*type_attribute_bounds_av_fn)(struct policydb *policydb,
                                            struct av_decision *avd);
 static void (*selinux_policy_cancel_fn)(struct selinux_load_state *load_state);
 static void (*selinux_policy_cancel_compat_fn)(void *state, struct selinux_load_state *load_state);
-struct sidtab;
-static void (*sidtab_cancel_convert_fn)(struct sidtab *sidtab);
 static void *(*vmalloc_fn)(unsigned long size);
 static void (*vfree_fn)(const void *addr);
 static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
@@ -423,7 +421,6 @@ static bool g_clean_policy_has_magisk;
 static struct selinux_load_state g_clean_load_state;
 static bool g_clean_load_state_ready;
 static bool g_clean_policydb_direct;
-static bool g_clean_sidtab_convert_canceled;
 static void *g_clean_policydb;
 static void *g_first_policy;
 static size_t g_policydb_offset;
@@ -491,10 +488,8 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid);
 static void refresh_clean_policydb(const char *reason, bool allow_fallback);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
-static bool current_is_policy_manager(void);
 static bool should_log_live_bypass(uid_t uid);
 static void log_bypass_once(const char *node, uid_t uid, const char *query);
-static void cancel_clean_sidtab_convert(const char *reason);
 static bool use_clean_blob_route(void);
 static bool use_legacy_clean_blob_query(void);
 static bool selinux_49_compat_path(void);
@@ -953,7 +948,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
     SYMBOL_CACHE_ENTRY("selinux_policy_cancel"),
-    SYMBOL_CACHE_ENTRY("sidtab_cancel_convert"),
     SYMBOL_CACHE_ENTRY("security_read_policy"),
     SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
@@ -1522,52 +1516,6 @@ static void *read_load_state_policy(void *load_state)
         return policy;
 
     return *(void **)load_state;
-}
-
-static struct sidtab *read_policy_sidtab(void *policy)
-{
-    struct sidtab *sidtab = NULL;
-
-    if (!policy)
-        return NULL;
-
-    if (copy_from_kernel_nofault_fn &&
-        copy_from_kernel_nofault_fn(&sidtab, policy, sizeof(sidtab)) == 0)
-        return sidtab;
-
-    return *(struct sidtab **)policy;
-}
-
-static void cancel_clean_sidtab_convert(const char *reason)
-{
-    struct sidtab *sidtab;
-
-    if (!READ_ONCE(g_clean_load_state_ready))
-        return;
-    if (READ_ONCE(g_clean_sidtab_convert_canceled))
-        return;
-
-    WRITE_ONCE(g_clean_sidtab_convert_canceled, true);
-
-    if (!g_clean_load_state.policy)
-        return;
-
-    if (!sidtab_cancel_convert_fn) {
-        pr_warn("[selinux_hook] CLEAN cannot cancel sidtab convert reason=%s: missing sidtab_cancel_convert\n",
-                reason ?: "(null)");
-        return;
-    }
-
-    sidtab = read_policy_sidtab(g_clean_load_state.policy);
-    if (!sidtab) {
-        pr_warn("[selinux_hook] CLEAN cannot cancel sidtab convert reason=%s policy=%px sidtab=NULL\n",
-                reason ?: "(null)", g_clean_load_state.policy);
-        return;
-    }
-
-    sidtab_cancel_convert_fn(sidtab);
-    selinux_hook_dbg("[selinux_hook] CLEAN canceled sidtab convert reason=%s clean_policy=%px sidtab=%px\n",
-                     reason ?: "(null)", g_clean_load_state.policy, sidtab);
 }
 
 static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count, loff_t *pos)
@@ -2625,7 +2573,6 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
             WRITE_ONCE(g_first_policy, NULL);
             WRITE_ONCE(g_first_policydb, NULL);
         }
-        WRITE_ONCE(g_clean_sidtab_convert_canceled, true);
     }
 
     refresh_clean_policydb("policy_commit", false);
@@ -3506,15 +3453,15 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
 
     sample[0] = '\0';
     sample_len = value && size ? copy_query_sample(sample, (const char *)value, size) : 0;
-	/*
+	
+    uid = current_uid();
+	manager = should_bypass_clean_filter(uid);
+    
+    /*
      * 4.9 setprocattr path / 4.9 setprocattr 路径：
      * avoid clean policydb helpers with device-specific ABI; only block known
      * DirtySepolicy probes while allowing manager/root callers through.
      */
-	 
-	uid = current_uid();
-	manager = should_bypass_clean_filter(uid);
-	 
     if (selinux_49_compat_path()) {
         if (!manager && (dirtysepolicy_context_should_hide(sample) ||
                          legacy_should_block_access_query(sample, sample_len)))
@@ -3545,7 +3492,6 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     }
     blocked = !manager && clean_ret == -EINVAL;
 
-    uid = current_uid();
     n = READ_ONCE(g_procattr_current_count) + 1;
     WRITE_ONCE(g_procattr_current_count, n);
 
@@ -4108,7 +4054,6 @@ static long init(const char *args, const char *event, void *__user r)
     type_attribute_bounds_av_fn = (void *)lookup_name_optional_suffix("type_attribute_bounds_av");
     selinux_policy_cancel_fn = (void *)lookup_name_optional_suffix("selinux_policy_cancel");
     selinux_policy_cancel_compat_fn = (void *)selinux_policy_cancel_fn;
-    sidtab_cancel_convert_fn = (void *)lookup_name_optional_suffix("sidtab_cancel_convert");
     security_read_policy_fn = (void *)lookup_name_optional_suffix("security_read_policy");
     security_read_policy_compat_fn = (void *)security_read_policy_fn;
     log_symbol_addr("selinux_state", g_selinux_state);
@@ -4123,7 +4068,6 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("constraint_expr_eval", (void *)constraint_expr_eval_fn);
     log_symbol_addr("type_attribute_bounds_av", (void *)type_attribute_bounds_av_fn);
     log_symbol_addr("selinux_policy_cancel", (void *)selinux_policy_cancel_fn);
-    log_symbol_addr("sidtab_cancel_convert", (void *)sidtab_cancel_convert_fn);
     pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d policydb_offset_fallback=%d write_op_fallback=%d load_state=%d\n",
             selinux_compat_call_needed() ? 1 : 0,
             clean_policydb_redirect_supported() ? 1 : 0,
@@ -4133,8 +4077,6 @@ static long init(const char *args, const char *event, void *__user r)
     if (selinux_compat_call_needed())
         pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
                 kver, g_selinux_state);
-    if (!sidtab_cancel_convert_fn)
-        pr_warn("[selinux_hook] cannot find sidtab_cancel_convert, clean snapshot may leave live policy busy\n");
 	/*
      * 4.9 security_read_policy ABI is vendor-specific / 4.9 该 helper ABI 依机型变化：
      * skip snapshot and hook on 4.9; non-4.9 keeps the existing clean-policy path.
