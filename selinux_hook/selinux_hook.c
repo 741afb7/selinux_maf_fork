@@ -511,7 +511,6 @@ static void log_symbol_addr(const char *name, const void *addr);
 static void zero_bytes(void *dst, size_t len);
 static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state);
 static void call_selinux_policy_cancel(struct selinux_load_state *load_state);
-static int call_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 static bool snapshot_magisk_policy_file(const char *reason, bool try_relative);
 static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, bool allow_fallback);
 static void before_security_load_policy(hook_fargs4_t *a, void *u);
@@ -1305,16 +1304,6 @@ static void call_selinux_policy_cancel(struct selinux_load_state *load_state)
         selinux_policy_cancel_fn(load_state);
 }
 
-static int call_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp)
-{
-    if (selinux_compat_call_needed() && security_context_to_sid_compat_fn)
-        return security_context_to_sid_compat_fn(g_selinux_state, scontext,
-                                                 scontext_len, out_sid, gfp);
-    if (security_context_to_sid_fn)
-        return security_context_to_sid_fn(scontext, scontext_len, out_sid, gfp);
-    return -ENOENT;
-}
-
 static unsigned int ebitmap_start_positive_intel(struct ebitmap *e,
                                                  struct ebitmap_node **node)
 {
@@ -1551,7 +1540,6 @@ static struct sidtab *read_policy_sidtab(void *policy)
 
 static void cancel_clean_sidtab_convert(const char *reason)
 {
-    void *policy;
     struct sidtab *sidtab;
 
     if (!READ_ONCE(g_clean_load_state_ready))
@@ -1559,27 +1547,27 @@ static void cancel_clean_sidtab_convert(const char *reason)
     if (READ_ONCE(g_clean_sidtab_convert_canceled))
         return;
 
-    policy = READ_ONCE(g_first_policy);
-    if (!policy)
+    WRITE_ONCE(g_clean_sidtab_convert_canceled, true);
+
+    if (!g_clean_load_state.policy)
         return;
 
     if (!sidtab_cancel_convert_fn) {
-        pr_warn("[selinux_hook] CLEAN cannot cancel live sidtab convert reason=%s: missing sidtab_cancel_convert\n",
+        pr_warn("[selinux_hook] CLEAN cannot cancel sidtab convert reason=%s: missing sidtab_cancel_convert\n",
                 reason ?: "(null)");
         return;
     }
 
-    sidtab = read_policy_sidtab(policy);
+    sidtab = read_policy_sidtab(g_clean_load_state.policy);
     if (!sidtab) {
-        pr_warn("[selinux_hook] CLEAN cannot cancel live sidtab convert reason=%s policy=%px sidtab=NULL\n",
-                reason ?: "(null)", policy);
+        pr_warn("[selinux_hook] CLEAN cannot cancel sidtab convert reason=%s policy=%px sidtab=NULL\n",
+                reason ?: "(null)", g_clean_load_state.policy);
         return;
     }
 
     sidtab_cancel_convert_fn(sidtab);
-    WRITE_ONCE(g_clean_sidtab_convert_canceled, true);
-    selinux_hook_dbg("[selinux_hook] CLEAN canceled live sidtab convert reason=%s policy=%px sidtab=%px clean_policy=%px\n",
-                     reason ?: "(null)", policy, sidtab, g_clean_load_state.policy);
+    selinux_hook_dbg("[selinux_hook] CLEAN canceled sidtab convert reason=%s clean_policy=%px sidtab=%px\n",
+                     reason ?: "(null)", g_clean_load_state.policy, sidtab);
 }
 
 static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count, loff_t *pos)
@@ -1801,6 +1789,12 @@ static void activate_clean_policy_blob(const char *reason)
         return;
     }
 
+    if (!READ_ONCE(g_clean_policydb)) {
+        try_load_clean_policydb_from_blob(reason);
+        if (READ_ONCE(g_clean_policydb))
+            return;
+    }
+
     if (!security_load_policy_has_load_state()) {
         try_load_clean_policydb_from_blob(reason);
         pr_info("[selinux_hook] CLEAN policy load skipped reason=%s: legacy security_load_policy commits live policy, blob fallback active\n",
@@ -1819,7 +1813,6 @@ static void activate_clean_policy_blob(const char *reason)
         if (!rc && g_clean_load_state.policy) {
             WRITE_ONCE(g_clean_load_state_ready, true);
             refresh_clean_policydb("clean_load", false);
-            cancel_clean_sidtab_convert("clean_load");
             selinux_hook_dbg("[selinux_hook] CLEAN policy loaded policy=%px policydb=%px convert=%px\n",
                              g_clean_load_state.policy, READ_ONCE(g_clean_policydb),
                              g_clean_load_state.convert_data);
@@ -2586,30 +2579,22 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
 {
     const char *ctx;
     size_t len;
-    int rc;
 
     if (!query || !out_sid)
         return -EINVAL;
-
-    refresh_clean_policydb("procattr_current", true);
-    if (!READ_ONCE(g_clean_policydb) ||
-        (!security_context_to_sid_fn && !security_context_to_sid_compat_fn))
-        return 1;
-    if (!clean_policydb_redirect_supported())
-        return 1;
 
     ctx = skip_spaces(query);
     len = token_len(ctx);
     if (!len)
         return -EINVAL;
 
-    if (!enter_clean_eval_scope())
-        return -EAGAIN;
+    if (!READ_ONCE(g_clean_policy_blob))
+        return 1; /* 没有可用的 clean blob，交给上层走别的判断 */
 
-    rc = call_security_context_to_sid(ctx, (u32)len, out_sid, (gfp_t)0);
-    leave_clean_eval_scope();
+    if (out_sid)
+        *out_sid = 0;
 
-    return rc;
+    return clean_context_exists(ctx) ? 0 : -EINVAL;
 }
 
 /* Hook: selinux_complete_init */
@@ -2627,12 +2612,23 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
     void *load_state = selinux_compat_call_needed() ? (void *)a->arg1
                                                    : (void *)a->arg0;
     void *policy = read_load_state_policy(load_state);
+    void *first_policy = READ_ONCE(g_first_policy);
 
     WRITE_ONCE(g_selinux_ready, true);
-    if (policy && !READ_ONCE(g_first_policy))
+
+    if (policy && !first_policy) {
         WRITE_ONCE(g_first_policy, policy);
+    } else if (policy && policy != first_policy) {
+        if (READ_ONCE(g_policydb_offset)) {
+            WRITE_ONCE(g_first_policy, NULL);
+        } else {
+            WRITE_ONCE(g_first_policy, NULL);
+            WRITE_ONCE(g_first_policydb, NULL);
+        }
+        WRITE_ONCE(g_clean_sidtab_convert_canceled, true);
+    }
+
     refresh_clean_policydb("policy_commit", false);
-    cancel_clean_sidtab_convert("policy_commit");
     selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policy=%px first policydb=%px clean policydb=%px\n",
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
@@ -3545,12 +3541,6 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
         } else {
             clean_ret = clean_policy_context_to_sid(sample, &clean_sid);
             clean_checked = clean_ret <= 0;
-        }
-        if (clean_ret == 1 && READ_ONCE(g_clean_policy_blob)) {
-            clean_checked = true;
-            clean_ret = clean_context_exists(sample) ? 0 : -EINVAL;
-        } else if (clean_ret == 1) {
-            clean_ret = 0;
         }
     }
     blocked = !manager && clean_ret == -EINVAL;
