@@ -51,6 +51,8 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
+/* Android kernels use 4 KiB, 16 KiB, or 64 KiB base pages. */
+#define SELINUX_STATUS_FAKE_PAGE_ALLOC_SIZE (64 * 1024)
 
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
@@ -403,6 +405,7 @@ static void (*type_attribute_bounds_av_fn)(struct policydb *policydb,
 static void (*selinux_policy_cancel_fn)(struct selinux_load_state *load_state);
 static void (*selinux_policy_cancel_compat_fn)(void *state, struct selinux_load_state *load_state);
 static void *(*vmalloc_fn)(unsigned long size);
+static void *(*vmalloc_to_page_fn)(const void *addr);
 static void (*vfree_fn)(const void *addr);
 static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
 static int (*filp_close_fn)(struct file *filp, fl_owner_t id);
@@ -463,6 +466,8 @@ static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
 static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
 static struct status_read_scope g_status_read_scopes[STATUS_READ_SCOPE_SLOTS];
 static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
+static void *g_fake_status_page;
+static bool g_status_page_redirect_hooked;
 
 /* Spinlock guards for the scope arrays.  We do not use DEFINE_SPINLOCK +
  * spin_lock() because the running kernel on this device does not export
@@ -544,8 +549,10 @@ static void uninstall_inline_hooks(void);
 static bool event_is_post_init(const char *event);
 static void try_complete_deferred_write_op_install(const char *reason);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
+static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
+static bool install_status_page_redirect(void);
 
 /*
  * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
@@ -931,6 +938,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("__copy_to_user"),
     SYMBOL_CACHE_ENTRY("vmalloc"),
     SYMBOL_CACHE_ENTRY("vmalloc_noprof"),
+    SYMBOL_CACHE_ENTRY("vmalloc_to_page"),
     SYMBOL_CACHE_ENTRY("vfree"),
     SYMBOL_CACHE_ENTRY("filp_open"),
     SYMBOL_CACHE_ENTRY("filp_close"),
@@ -952,7 +960,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
-    SYMBOL_CACHE_ENTRY("selinux_status_update_seqlock"),
+    SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
     SYMBOL_CACHE_ENTRY("selinux_status_update_policyload"),
     SYMBOL_CACHE_ENTRY("security_setprocattr"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
@@ -3731,19 +3739,83 @@ static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u)
 }
 
 /*
- * Hook: selinux_status_update_seqlock
- *
- * Prevents the kernel from updating the sequence field in the status page.
- * Old kernels (< 6.6): detection expects sequence=0 policyload=0 (initial state).
- * Skip the update entirely so the status page stays frozen at 0/0.
- *
- * Kernel < 5.19: selinux_status_update_seqlock(struct selinux_state *state)  argc=1
- * Kernel >= 5.19: selinux_status_update_seqlock(void)                        argc=0
+ * Return a clean backing page when an app opens /sys/fs/selinux/status.
+ * sel_open_handle_status() stores selinux_kernel_status_page()'s return value
+ * in filp->private_data, so redirecting the page factory covers both the read
+ * and mmap paths without relying on any private structure offsets.
  */
-static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u)
+static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u)
 {
-    if (kver < VERSION(6, 6, 0))
-        a->skip_origin = 1;
+    void *page;
+
+    if (should_bypass_clean_filter(current_uid()))
+        return;
+
+    if (!g_fake_status_page || !vmalloc_to_page_fn)
+        return;
+
+    page = vmalloc_to_page_fn(g_fake_status_page);
+    if (!page)
+        return;
+
+    a->ret = (uint64_t)page;
+    a->skip_origin = 1;
+}
+
+static bool install_status_page_redirect(void)
+{
+    unsigned long addr;
+    hook_err_t err;
+    void *page;
+
+    if (READ_ONCE(g_status_page_redirect_hooked))
+        return true;
+
+    if (!vmalloc_fn || !vmalloc_to_page_fn) {
+        pr_warn("[selinux_hook] status page redirect unavailable vmalloc=%px vmalloc_to_page=%px\n",
+                vmalloc_fn, vmalloc_to_page_fn);
+        return false;
+    }
+
+    if (!g_fake_status_page) {
+        g_fake_status_page = vmalloc_fn(SELINUX_STATUS_FAKE_PAGE_ALLOC_SIZE);
+        if (!g_fake_status_page) {
+            pr_warn("[selinux_hook] fake status page allocation failed\n");
+            return false;
+        }
+        zero_bytes(g_fake_status_page, SELINUX_STATUS_FAKE_PAGE_ALLOC_SIZE);
+        copy_bytes(g_fake_status_page, g_clean_status_bytes,
+                   sizeof(g_clean_status_bytes));
+    }
+
+    page = vmalloc_to_page_fn(g_fake_status_page);
+    if (!page) {
+        pr_warn("[selinux_hook] cannot translate fake status page to struct page\n");
+        return false;
+    }
+
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_kernel_status_page");
+    if (!addr) {
+        pr_warn("[selinux_hook] cannot find selinux_kernel_status_page\n");
+        return false;
+    }
+
+    /* Both void(void) and stateful page-factory ABIs are safe through the
+     * four-register transit: a state argument remains in x0 when present,
+     * while a void function ignores it. */
+    err = hook_wrap((void *)addr, 1, before_selinux_kernel_status_page,
+                    NULL, NULL);
+    if (err != HOOK_NO_ERR) {
+        pr_warn("[selinux_hook] hook selinux_kernel_status_page failed err=%d\n",
+                (int)err);
+        return false;
+    }
+
+    record_inline_hook((void *)addr, before_selinux_kernel_status_page, NULL);
+    WRITE_ONCE(g_status_page_redirect_hooked, true);
+    pr_info("[selinux_hook] status page redirect installed factory=%px fake_page=%px backing=%px\n",
+            (void *)addr, g_fake_status_page, page);
+    return true;
 }
 
 /*
@@ -4031,6 +4103,7 @@ static long init(const char *args, const char *event, void *__user r)
     vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc");
     if (!vmalloc_fn)
         vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc_noprof");
+    vmalloc_to_page_fn = (void *)lookup_name_optional_suffix("vmalloc_to_page");
     vfree_fn = (void *)lookup_name_optional_suffix("vfree");
     filp_open_fn = (void *)lookup_name_optional_suffix("filp_open");
     filp_close_fn = (void *)lookup_name_optional_suffix("filp_close");
@@ -4150,27 +4223,25 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find sel_read_handle_status, status read hook skipped\n");
     }
 
-    /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
-    addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
-    if (addr) {
-        record_inline_hook((void *)addr, NULL, after_sel_mmap_handle_status);
-        selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
-        hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
+    bool status_page_redirect = false;
+    if (kver < VERSION(6, 6, 0))
+    {
+        status_page_redirect = install_status_page_redirect();
+        if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
+        else pr_warn("[selinux_hook] status page redirect failed\n");
     }
 
-    /* Freeze status page sequence/policyload on old kernels */
-    addr = (unsigned long)lookup_name_optional_suffix("selinux_status_update_seqlock");
-    if (addr) {
-        /* argc=1 on < 5.19 (state arg), argc=0 on >= 5.19 */
-        int argc = (kver < VERSION(5, 19, 0)) ? 1 : 0;
-        record_inline_hook((void *)addr, before_selinux_status_update_seqlock,
-                           NULL);
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_seqlock argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_seqlock, NULL, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find selinux_status_update_seqlock\n");
+    if(kver >= VERSION(6, 6, 0) || status_page_redirect == false)
+    {
+        /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
+        addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
+        if (addr) {
+            record_inline_hook((void *)addr, NULL, after_sel_mmap_handle_status);
+            selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
+            hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
+        } else {
+            pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
+        }
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("selinux_status_update_policyload");
