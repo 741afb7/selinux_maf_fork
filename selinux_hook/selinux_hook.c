@@ -4224,14 +4224,11 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     bool status_page_redirect = false;
-    if (kver < VERSION(6, 6, 0))
-    {
-        status_page_redirect = install_status_page_redirect();
-        if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
-        else pr_warn("[selinux_hook] status page redirect failed\n");
-    }
+    status_page_redirect = install_status_page_redirect();
+    if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
+    else pr_warn("[selinux_hook] status page redirect failed\n");
 
-    if(kver >= VERSION(6, 6, 0) || status_page_redirect == false)
+    if(status_page_redirect == false)
     {
         /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
         addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
