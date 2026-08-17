@@ -4409,6 +4409,24 @@ static long exit_(void *__user r)
     WRITE_ONCE(g_write_op_install_deferred, false);
     uninstall_write_op_hooks();
     uninstall_inline_hooks();
+
+    /*
+     * The fake page is returned through selinux_kernel_status_page() and may
+     * still be referenced by already-open status files or VMAs.  Freeing it
+     * here prevents a persistent vmalloc leak, but deliberately accepts the
+     * resulting stale-reference/UAF risk during module unload.
+     */
+    if (g_fake_status_page) {
+        pr_warn("[selinux_hook] UNSAFE: forcing fake SELinux status page free at exit; stale file/VMA references may cause UAF or a kernel crash\n");
+        if (vfree_fn) {
+            vfree_fn(g_fake_status_page);
+            g_fake_status_page = NULL;
+            WRITE_ONCE(g_status_page_redirect_hooked, false);
+        } else {
+            pr_err("[selinux_hook] cannot free fake SELinux status page: vfree is unavailable; vmalloc memory remains allocated\n");
+        }
+    }
+
     g_policy_capture_in_progress = false;
 
     if (READ_ONCE(g_clean_policydb_direct) && g_clean_policydb) {
