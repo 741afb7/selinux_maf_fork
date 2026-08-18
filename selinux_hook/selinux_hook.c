@@ -547,8 +547,6 @@ static bool event_is_post_init(const char *event);
 static void try_complete_deferred_write_op_install(const char *reason);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u);
-static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
-static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
 static bool install_status_page_redirect(void);
 
 /*
@@ -974,7 +972,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
     SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
-    SYMBOL_CACHE_ENTRY("selinux_status_update_policyload"),
     SYMBOL_CACHE_ENTRY("security_setprocattr"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
@@ -3833,19 +3830,6 @@ static bool install_status_page_redirect(void)
     return true;
 }
 
-/*
- * Hook: selinux_status_update_policyload
- *
- * Prevents the policyload counter in the status page from incrementing.
- *
- * Kernel < 5.19: selinux_status_update_policyload(state, seqno)  argc=2
- * Kernel >= 5.19: selinux_status_update_policyload(seqno)        argc=1
- */
-static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u)
-{
-    if (kver < VERSION(6, 6, 0))
-        a->skip_origin = 1;
-}
 static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
 {
     uid_t uid = current_uid();
@@ -4254,18 +4238,6 @@ static long init(const char *args, const char *event, void *__user r)
         } else {
             pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
         }
-    }
-
-    addr = (unsigned long)lookup_name_optional_suffix("selinux_status_update_policyload");
-    if (addr) {
-        /* argc=2 on < 5.19 (state, seqno), argc=1 on >= 5.19 (seqno) */
-        int argc = (kver < VERSION(5, 19, 0)) ? 2 : 1;
-        record_inline_hook((void *)addr, before_selinux_status_update_policyload,
-                           NULL);
-        selinux_hook_dbg("[selinux_hook] hook selinux_status_update_policyload argc=%d kver=%x\n", argc, kver);
-        hook_wrap((void *)addr, argc, before_selinux_status_update_policyload, NULL, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find selinux_status_update_policyload\n");
     }
 
     if (!security_load_policy_fn) {
