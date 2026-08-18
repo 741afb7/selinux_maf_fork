@@ -51,9 +51,6 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
-/* Android kernels use 4 KiB, 16 KiB, or 64 KiB base pages. */
-#define SELINUX_STATUS_FAKE_PAGE_ALLOC_SIZE (64 * 1024)
-
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
 typedef enum {
@@ -646,6 +643,22 @@ static void zero_bytes(void *dst, size_t len)
 
     for (i = 0; i < len; i++)
         d[i] = 0;
+}
+
+static size_t runtime_page_size(void)
+{
+    uint64_t tcr_el1;
+    uint64_t tg1;
+
+    /* Match KernelPatch's runtime page-size detection for the TTBR1 range. */
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
+    tg1 = (tcr_el1 >> 30) & 0x3;
+
+    if (tg1 == 1)
+        return 16 * 1024;
+    if (tg1 == 3)
+        return 64 * 1024;
+    return 4 * 1024;
 }
 
 static int copy_status_to_user(void __user *dst, const void *src, size_t len)
@@ -3767,6 +3780,7 @@ static bool install_status_page_redirect(void)
     unsigned long addr;
     hook_err_t err;
     void *page;
+    size_t fake_page_size = runtime_page_size();
 
     if (READ_ONCE(g_status_page_redirect_hooked))
         return true;
@@ -3778,12 +3792,13 @@ static bool install_status_page_redirect(void)
     }
 
     if (!g_fake_status_page) {
-        g_fake_status_page = vmalloc_fn(SELINUX_STATUS_FAKE_PAGE_ALLOC_SIZE);
+        g_fake_status_page = vmalloc_fn(fake_page_size);
         if (!g_fake_status_page) {
-            pr_warn("[selinux_hook] fake status page allocation failed\n");
+            pr_warn("[selinux_hook] fake status page allocation failed size=%zu\n",
+                    fake_page_size);
             return false;
         }
-        zero_bytes(g_fake_status_page, SELINUX_STATUS_FAKE_PAGE_ALLOC_SIZE);
+        zero_bytes(g_fake_status_page, fake_page_size);
         copy_bytes(g_fake_status_page, g_clean_status_bytes,
                    sizeof(g_clean_status_bytes));
     }
@@ -3813,8 +3828,8 @@ static bool install_status_page_redirect(void)
 
     record_inline_hook((void *)addr, before_selinux_kernel_status_page, NULL);
     WRITE_ONCE(g_status_page_redirect_hooked, true);
-    pr_info("[selinux_hook] status page redirect installed factory=%px fake_page=%px backing=%px\n",
-            (void *)addr, g_fake_status_page, page);
+    pr_info("[selinux_hook] status page redirect installed factory=%px fake_page=%px backing=%px size=%zu\n",
+            (void *)addr, g_fake_status_page, page, fake_page_size);
     return true;
 }
 
