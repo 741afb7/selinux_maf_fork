@@ -3505,7 +3505,8 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
 /*
  * Shared task-first setprocattr body / 共用的 task-first setprocattr 主体：
  * Polaris 4.9 passes (task, name, value, size), so arg0 is not lsm/name and the
- * normal wrappers cannot be reused directly. 两个 4.9 wrapper 只差日志名和计数器。
+ * normal wrappers cannot be reused directly. The 4.9 wrapper keeps its own
+ * probe label and counter.
  */
 static void before_task_setprocattr_49(hook_fargs4_t *a, const char *hook,
                                        u32 *counter)
@@ -3539,13 +3540,14 @@ static void before_selinux_setprocattr_task_49(hook_fargs4_t *a, void *u)
                                &g_selinux_setprocattr_probe_count);
 }
 
-/* Hook fallback: selinux_setprocattr(name, value, size) */
-static void before_selinux_setprocattr(hook_fargs3_t *a, void *u)
+/* Hook: selinux_setprocattr(name, value, size) clean-policy wrapper */
+static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 {
     const char *name = (const char *)a->arg0;
-    const void *value = (const void *)a->arg1;
-    size_t size = (size_t)a->arg2;
+    uid_t uid = current_uid();
     u32 n;
+
+    a->local.data0 = 0;
 
     n = READ_ONCE(g_selinux_setprocattr_probe_count);
     if (n < 16) {
@@ -3553,14 +3555,20 @@ static void before_selinux_setprocattr(hook_fargs3_t *a, void *u)
         WRITE_ONCE(g_selinux_setprocattr_probe_count, n);
         pr_info("[selinux_hook] PROBE selinux_setprocattr #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
                 n, current_uid(), current_comm(), (void *)a->arg0,
-                (void *)a->arg1, size);
+                (void *)a->arg1, (size_t)a->arg2);
     }
 
-    if (!filter_procattr_current("selinux_setprocattr", NULL, name, value, size))
+    if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
         return;
 
-    a->skip_origin = 1;
-    a->ret = -EINVAL;
+    if (enter_clean_eval_scope())
+        a->local.data0 = 1;
+}
+
+static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
+{
+    if (a->local.data0)
+        leave_clean_eval_scope();
 }
 
 static ssize_t copy_clean_status_to_user(char __user *buf, size_t count,
@@ -4084,9 +4092,11 @@ static long init(const char *args, const char *event, void *__user r)
             selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=4 mode=task 4.9\n");
             hook_wrap((void *)addr, 4, before_selinux_setprocattr_task_49, NULL, NULL);
         } else {
-            record_inline_hook((void *)addr, before_selinux_setprocattr, NULL);
-            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3\n");
-            hook_wrap((void *)addr, 3, before_selinux_setprocattr, NULL, NULL);
+            record_inline_hook((void *)addr, before_selinux_setprocattr_clean_eval,
+                               after_selinux_setprocattr_clean_eval);
+            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3 clean-eval\n");
+            hook_wrap((void *)addr, 3, before_selinux_setprocattr_clean_eval,
+                      after_selinux_setprocattr_clean_eval, NULL);
         }
     } else {
         pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
