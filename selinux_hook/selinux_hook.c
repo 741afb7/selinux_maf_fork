@@ -32,11 +32,8 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 
 #define ACCESS_SAMPLE_MAX 256
 #define ACCESS_PROBE_SLOTS 32
-#define SELINUX_POLICYDB_FALLBACK_OFFSET sizeof(void *)
 #define CLEAN_POLICYDB_ALLOC_SIZE 0x4000
 #define SELINUX_LEGACY_BLOB_QUERY_MAX VERSION(4, 15, 0)
-#define SELINUX_BLOB_ROUTE_MIN VERSION(5, 3, 0)
-#define SELINUX_BLOB_ROUTE_MAX VERSION(6, 2, 0)
 #define contains_case_literal(s, len, lit) contains_case_lit((s), (len), (lit), sizeof(lit) - 1)
 
 #define MAGISK_POLICY_PATH "/.magisk/selinux/load"
@@ -80,8 +77,6 @@ static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t
 static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
 static const char *g_copy_to_user_name;
 static int (*security_load_policy_fn)(void *data, size_t len, struct selinux_load_state *load_state);
-static int (*security_load_policy_compat_fn)(void *state, void *data, size_t len,
-                                             struct selinux_load_state *load_state);
 static int (*security_context_to_sid_fn)(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 static int (*security_context_to_sid_compat_fn)(void *state, const char *scontext, u32 scontext_len,
                                                 u32 *out_sid, gfp_t gfp);
@@ -396,8 +391,6 @@ static void (*type_attribute_bounds_av_fn)(struct policydb *policydb,
                                            struct context *tcontext,
                                            u16 tclass,
                                            struct av_decision *avd);
-static void (*selinux_policy_cancel_fn)(struct selinux_load_state *load_state);
-static void (*selinux_policy_cancel_compat_fn)(void *state, struct selinux_load_state *load_state);
 static void *(*vmalloc_fn)(unsigned long size);
 static void *(*vmalloc_to_page_fn)(const void *addr);
 static void (*vfree_fn)(const void *addr);
@@ -414,21 +407,15 @@ static u32 g_clean_access_count;
 static void *g_clean_policy_blob;
 static size_t g_clean_policy_len;
 static bool g_clean_policy_has_magisk;
-static struct selinux_load_state g_clean_load_state;
-static bool g_clean_load_state_ready;
 static bool g_clean_policydb_direct;
 static void *g_clean_policydb;
-static void *g_first_policy;
-static size_t g_policydb_offset;
 static u32 g_clean_eval_depth;
 static u32 g_bypass_access_log_count;
 static u32 g_bypass_context_log_count;
 
 static u32 g_bypass_policy_log_count;
-static u32 g_internal_policy_load_depth;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_clean_policydb_av_disabled;
-static bool g_policydb_offset_fallback_warned;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
@@ -480,25 +467,20 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len);
 static bool clean_context_exists(const char *query);
 static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query);
 static bool legacy_should_block_access_query(const char *query, size_t len);
-static void refresh_clean_policydb(const char *reason, bool allow_fallback);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
 static bool should_log_live_bypass(uid_t uid);
 static void log_bypass_once(const char *node, uid_t uid, const char *query);
-static bool use_clean_blob_route(void);
 static bool use_legacy_clean_blob_query(void);
 static bool selinux_414_compat_path(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_state_arg_required(void);
 static bool selinux_compat_call_needed(void);
-static bool policydb_offset_fallback_allowed(void);
 static bool write_op_slot_fallback_allowed(void);
 static void resolve_required_symbols_once(void);
 static void *lookup_name_optional_suffix(const char *base);
 static void log_symbol_addr(const char *name, const void *addr);
 static void zero_bytes(void *dst, size_t len);
-static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state);
-static void call_selinux_policy_cancel(struct selinux_load_state *load_state);
 static bool snapshot_magisk_policy_file(const char *reason, bool try_relative);
 static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, bool allow_fallback);
 static void before_security_load_policy(hook_fargs4_t *a, void *u);
@@ -761,11 +743,6 @@ static bool should_log_live_bypass(uid_t uid)
     return uid >= 10000;
 }
 
-static bool use_clean_blob_route(void)
-{
-    return kver >= SELINUX_BLOB_ROUTE_MIN && kver < SELINUX_BLOB_ROUTE_MAX;
-}
-
 static bool use_legacy_clean_blob_query(void)
 {
     return kver < SELINUX_LEGACY_BLOB_QUERY_MAX;
@@ -850,21 +827,6 @@ static bool selinux_state_arg_required(void)
     return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
 }
 
-static bool policydb_offset_fallback_allowed(void)
-{
-    /*
-     * policydb 偏移不能靠 sizeof(void *) 盲猜。只有确认当前内核像已审计的
-     * 4.14 sm8150/cepheus stateful 布局，或者已经是非 legacy 的新内核时，
-     * 才允许这个兜底；否则宁可跳过高风险路径。
-     *
-     * Do not guess policydb layout on pre-baseline legacy kernels.  The old
-     * sizeof(void *) fallback is only acceptable once the runtime looks like
-     * the audited 4.14 sm8150/cepheus stateful SELinux layout or a newer
-     * non-legacy kernel.
-     */
-    return !use_legacy_clean_blob_query() || g_selinux_state;
-}
-
 static bool write_op_slot_fallback_allowed(void)
 {
     /*
@@ -872,24 +834,6 @@ static bool write_op_slot_fallback_allowed(void)
      * newer kernels. Keep unknown legacy layouts on the direct-symbol path.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
-}
-
-static bool security_load_policy_has_load_state(void)
-{
-    /*
-     * 4.14 的 security_load_policy() 会直接提交 live policy，没有新版
-     * load_state/cancel 流程。只有解析到 selinux_policy_cancel 这类新版
-     * 辅助符号时，才走带 load_state 的调用；否则使用 clean blob /
-     * policydb_read 路线。
-     *
-     * The referenced 4.14 services.c commits the loaded policy directly:
-     *   security_load_policy(struct selinux_state *state, void *data, size_t len)
-     *
-     * Newer kernels grow staged load-state/cancel helpers.  Use the presence of
-     * selinux_policy_cancel()/compat as the runtime signal before calling the
-     * load_state form; otherwise fall back to clean blob / policydb_read.
-     */
-    return selinux_policy_cancel_fn || selinux_policy_cancel_compat_fn;
 }
 
 struct symbol_cache_entry {
@@ -932,7 +876,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("cond_compute_av"),
     SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
-    SYMBOL_CACHE_ENTRY("selinux_policy_cancel"),
     SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
@@ -1258,28 +1201,6 @@ static void log_symbol_addr(const char *name, const void *addr)
             name ?: "(null)", addr ? "found" : "missing", addr);
 }
 
-static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state)
-{
-    if (!security_load_policy_has_load_state())
-        return -EOPNOTSUPP;
-    if (selinux_compat_call_needed() && security_load_policy_compat_fn)
-        return security_load_policy_compat_fn(g_selinux_state, data, len,
-                                              load_state);
-    if (security_load_policy_fn)
-        return security_load_policy_fn(data, len, load_state);
-    return -ENOENT;
-}
-
-static void call_selinux_policy_cancel(struct selinux_load_state *load_state)
-{
-    if (selinux_compat_call_needed() && selinux_policy_cancel_compat_fn) {
-        selinux_policy_cancel_compat_fn(g_selinux_state, load_state);
-        return;
-    }
-    if (selinux_policy_cancel_fn)
-        selinux_policy_cancel_fn(load_state);
-}
-
 static unsigned int ebitmap_start_positive_intel(struct ebitmap *e,
                                                  struct ebitmap_node **node)
 {
@@ -1486,20 +1407,6 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
     return true;
 }
 
-static void *read_load_state_policy(void *load_state)
-{
-    void *policy = NULL;
-
-    if (!load_state)
-        return NULL;
-
-    if (copy_from_kernel_nofault_fn &&
-        copy_from_kernel_nofault_fn(&policy, load_state, sizeof(policy)) == 0)
-        return policy;
-
-    return *(void **)load_state;
-}
-
 static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count, loff_t *pos)
 {
     if (!kernel_read_fn)
@@ -1594,65 +1501,6 @@ static bool snapshot_magisk_policy_file(const char *reason, bool try_relative)
     return false;
 }
 
-static void refresh_policydb_offset(const char *reason, bool allow_fallback)
-{
-    void *policy = READ_ONCE(g_first_policy);
-    void *policydb = READ_ONCE(g_first_policydb);
-    unsigned long diff;
-
-    if (READ_ONCE(g_policydb_offset))
-        return;
-
-    if (policy && policydb && policydb > policy) {
-        diff = (unsigned long)policydb - (unsigned long)policy;
-        if (diff < 0x100000) {
-            WRITE_ONCE(g_policydb_offset, (size_t)diff);
-            selinux_hook_dbg("[selinux_hook] policydb offset learned reason=%s policy=%px policydb=%px off=%zu\n",
-                             reason ?: "(null)", policy, policydb,
-                             READ_ONCE(g_policydb_offset));
-            return;
-        }
-    }
-
-    if (!allow_fallback)
-        return;
-
-    if (!policydb_offset_fallback_allowed()) {
-        if (!READ_ONCE(g_policydb_offset_fallback_warned)) {
-            WRITE_ONCE(g_policydb_offset_fallback_warned, true);
-            pr_warn("[selinux_hook] policydb offset fallback refused reason=%s kver=%x policy=%px policydb=%px: legacy route lacks 4.14 selinux_state baseline\n",
-                    reason ?: "(null)", kver, policy, policydb);
-        }
-        return;
-    }
-
-    WRITE_ONCE(g_policydb_offset, (size_t)SELINUX_POLICYDB_FALLBACK_OFFSET);
-    selinux_hook_dbg("[selinux_hook] policydb offset fallback reason=%s policy=%px policydb=%px off=%zu\n",
-                     reason ?: "(null)", policy, policydb, READ_ONCE(g_policydb_offset));
-}
-
-static void refresh_clean_policydb(const char *reason, bool allow_fallback)
-{
-    void *policy;
-    size_t off;
-
-    if (!clean_policydb_redirect_supported())
-        return;
-    if (READ_ONCE(g_clean_policydb_direct))
-        return;
-
-    if (!READ_ONCE(g_clean_load_state_ready) || !g_clean_load_state.policy)
-        return;
-
-    refresh_policydb_offset(reason, allow_fallback);
-    off = READ_ONCE(g_policydb_offset);
-    if (!off)
-        return;
-
-    policy = g_clean_load_state.policy;
-    WRITE_ONCE(g_clean_policydb, (void *)((char *)policy + off));
-}
-
 static void try_load_clean_policydb_from_blob(const char *reason)
 {
     struct policy_file fp;
@@ -1697,60 +1545,8 @@ static void try_load_clean_policydb_from_blob(const char *reason)
 
 static void activate_clean_policy_blob(const char *reason)
 {
-    void *data = READ_ONCE(g_clean_policy_blob);
-    size_t len = READ_ONCE(g_clean_policy_len);
-    int rc;
-
-    if (!data || !len)
-        return;
-
-    if (use_clean_blob_route()) {
+    if (READ_ONCE(g_clean_policy_blob) && READ_ONCE(g_clean_policy_len))
         try_load_clean_policydb_from_blob(reason);
-        pr_info("[selinux_hook] CLEAN policy blob route reason=%s: blob=%px len=%zu policydb=%px direct=%d\n",
-                reason ?: "(null)", data, len, READ_ONCE(g_clean_policydb),
-                READ_ONCE(g_clean_policydb_direct) ? 1 : 0);
-        return;
-    }
-
-    if (!clean_policydb_redirect_supported()) {
-        try_load_clean_policydb_from_blob(reason);
-        pr_info("[selinux_hook] CLEAN legacy policy blob route reason=%s: blob=%px len=%zu policydb=%px\n",
-                reason ?: "(null)", data, len, READ_ONCE(g_clean_policydb));
-        return;
-    }
-
-    if (!READ_ONCE(g_clean_policydb)) {
-        try_load_clean_policydb_from_blob(reason);
-        if (READ_ONCE(g_clean_policydb))
-            return;
-    }
-
-    if (!security_load_policy_has_load_state()) {
-        try_load_clean_policydb_from_blob(reason);
-        pr_info("[selinux_hook] CLEAN policy load skipped reason=%s: legacy security_load_policy commits live policy, blob fallback active\n",
-                reason ?: "(null)");
-        return;
-    }
-
-    if ((security_load_policy_fn || security_load_policy_compat_fn) &&
-        !READ_ONCE(g_clean_load_state_ready)) {
-        WRITE_ONCE(g_internal_policy_load_depth,
-                   READ_ONCE(g_internal_policy_load_depth) + 1);
-        rc = call_security_load_policy(data, len, &g_clean_load_state);
-        if (READ_ONCE(g_internal_policy_load_depth))
-            WRITE_ONCE(g_internal_policy_load_depth,
-                       READ_ONCE(g_internal_policy_load_depth) - 1);
-        if (!rc && g_clean_load_state.policy) {
-            WRITE_ONCE(g_clean_load_state_ready, true);
-            refresh_clean_policydb("clean_load", false);
-            selinux_hook_dbg("[selinux_hook] CLEAN policy loaded policy=%px policydb=%px convert=%px\n",
-                             g_clean_load_state.policy, READ_ONCE(g_clean_policydb),
-                             g_clean_load_state.convert_data);
-        } else {
-            pr_warn("[selinux_hook] CLEAN policy load failed rc=%d policy=%px\n",
-                    rc, g_clean_load_state.policy);
-        }
-    }
 }
 
 static void snapshot_clean_policy(const char *reason)
@@ -2517,27 +2313,9 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
 /* Hook: selinux_policy_commit */
 static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
 {
-    void *load_state = selinux_compat_call_needed() ? (void *)a->arg1
-                                                   : (void *)a->arg0;
-    void *policy = read_load_state_policy(load_state);
-    void *first_policy = READ_ONCE(g_first_policy);
-
     WRITE_ONCE(g_selinux_ready, true);
-
-    if (policy && !first_policy) {
-        WRITE_ONCE(g_first_policy, policy);
-    } else if (policy && policy != first_policy) {
-        if (READ_ONCE(g_policydb_offset)) {
-            WRITE_ONCE(g_first_policy, NULL);
-        } else {
-            WRITE_ONCE(g_first_policy, NULL);
-            WRITE_ONCE(g_first_policydb, NULL);
-        }
-    }
-
-    refresh_clean_policydb("policy_commit", false);
-    selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policy=%px first policydb=%px clean policydb=%px\n",
-                     g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
+    selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policydb=%px clean policydb=%px\n",
+                     g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
 	try_complete_deferred_write_op_install("policy_commit");
 }
@@ -2613,10 +2391,8 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     if (!clean_policydb_redirect_supported())
         return;
 
-    if (READ_ONCE(g_internal_policy_load_depth) || bypass) //模块内部加载 或 UID < 10000
-	{
-        return;  // 完全跳过，使用原始 policydb
-    }
+    if (bypass)
+        return;
     
     
     /*
@@ -2641,7 +2417,6 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     if (!READ_ONCE(g_first_policydb)) {
         WRITE_ONCE(g_first_policydb, policydb);
         selinux_hook_dbg("[selinux_hook] SAVED first policydb @ %px\n", g_first_policydb);
-        refresh_clean_policydb("first_compute_av", false);
         snapshot_clean_policy("first_compute_av");
         return;
     }
@@ -2704,7 +2479,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
     struct extended_perms *xperms;
     struct av_decision clean_avd;
 
-    if (READ_ONCE(g_internal_policy_load_depth) || should_bypass_clean_filter(current_uid()))
+    if (should_bypass_clean_filter(current_uid()))
         return;
 
     clean_pdb = (struct policydb *)READ_ONCE(g_clean_policydb);
@@ -2805,8 +2580,6 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
-    refresh_clean_policydb("access", true);
-
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
@@ -2884,8 +2657,6 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
         return;
     }
 
-    refresh_clean_policydb("context", true);
-
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
@@ -2938,19 +2709,16 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
         }
     }
 
-    if (mode == 2) {
-        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policy=%px clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
+    if (mode == 2)
+        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
                          probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
-                         g_clean_load_state.policy, READ_ONCE(g_clean_policydb),
-                         READ_ONCE(g_clean_policy_blob), READ_ONCE(g_clean_policy_len),
-                         probe->query);
-        return;
-    }
-
-    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policy=%px clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
+                         READ_ONCE(g_clean_policydb), READ_ONCE(g_clean_policy_blob),
+                         READ_ONCE(g_clean_policy_len), probe->query);
+    else
+        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
                      probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
-                     g_clean_load_state.policy, READ_ONCE(g_clean_policydb),
-                     READ_ONCE(g_clean_policy_blob), READ_ONCE(g_clean_policy_len),
+                     READ_ONCE(g_clean_policydb), READ_ONCE(g_clean_policy_blob),
+                     READ_ONCE(g_clean_policy_len),
                      probe->query);
 }
 
@@ -3656,9 +3424,8 @@ static long init(const char *args, const char *event, void *__user r)
                      (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
-    pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
-            kver, use_legacy_clean_blob_query() ? 1 : 0,
-            use_clean_blob_route() ? 1 : 0);
+    pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d\n",
+            kver, use_legacy_clean_blob_query() ? 1 : 0);
     if (kver >= VERSION(4, 9, 0) && kver < VERSION(4, 10, 0)) {
         pr_warn("[selinux_hook] Linux 4.9.x is unsupported; skipping SELinux hooks\n");
         return 0;
@@ -3708,7 +3475,6 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find file-read symbols: filp_open=%px filp_close=%px kernel_read=%px vfs_llseek=%px\n",
                 filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn);
     security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
-    security_load_policy_compat_fn = (void *)security_load_policy_fn;
     security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
     security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
     policydb_read_fn = (void *)lookup_name_optional_suffix("policydb_read");
@@ -3719,8 +3485,6 @@ static long init(const char *args, const char *event, void *__user r)
     cond_compute_av_fn = (void *)lookup_name_optional_suffix("cond_compute_av");
     constraint_expr_eval_fn = (void *)lookup_name_optional_suffix("constraint_expr_eval");
     type_attribute_bounds_av_fn = (void *)lookup_name_optional_suffix("type_attribute_bounds_av");
-    selinux_policy_cancel_fn = (void *)lookup_name_optional_suffix("selinux_policy_cancel");
-    selinux_policy_cancel_compat_fn = (void *)selinux_policy_cancel_fn;
     log_symbol_addr("selinux_state", g_selinux_state);
     log_symbol_addr("security_context_to_sid", (void *)security_context_to_sid_fn);
     log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
@@ -3731,13 +3495,10 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("cond_compute_av", (void *)cond_compute_av_fn);
     log_symbol_addr("constraint_expr_eval", (void *)constraint_expr_eval_fn);
     log_symbol_addr("type_attribute_bounds_av", (void *)type_attribute_bounds_av_fn);
-    log_symbol_addr("selinux_policy_cancel", (void *)selinux_policy_cancel_fn);
-    pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d policydb_offset_fallback=%d write_op_fallback=%d load_state=%d\n",
+    pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d write_op_fallback=%d\n",
             selinux_compat_call_needed() ? 1 : 0,
             clean_policydb_redirect_supported() ? 1 : 0,
-            policydb_offset_fallback_allowed() ? 1 : 0,
-            write_op_slot_fallback_allowed() ? 1 : 0,
-            security_load_policy_has_load_state() ? 1 : 0);
+            write_op_slot_fallback_allowed() ? 1 : 0);
     if (selinux_compat_call_needed())
         pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
                 kver, g_selinux_state);
@@ -3928,15 +3689,6 @@ static long exit_(void *__user r)
             policydb_destroy_fn((struct policydb *)g_clean_policydb);
         if (vfree_fn)
             vfree_fn(g_clean_policydb);
-        g_clean_policydb = NULL;
-        g_clean_policydb_direct = false;
-    }
-
-    if (g_clean_load_state_ready && (selinux_policy_cancel_fn || selinux_policy_cancel_compat_fn)) {
-        call_selinux_policy_cancel(&g_clean_load_state);
-        g_clean_load_state_ready = false;
-        g_clean_load_state.policy = NULL;
-        g_clean_load_state.convert_data = NULL;
         g_clean_policydb = NULL;
         g_clean_policydb_direct = false;
     }
