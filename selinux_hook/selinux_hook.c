@@ -80,8 +80,6 @@ static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t si
 static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t size);
 static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
 static const char *g_copy_to_user_name;
-static int (*security_read_policy_fn)(void **data, size_t *len);
-static int (*security_read_policy_compat_fn)(void *state, void **data, size_t *len);
 static int (*security_load_policy_fn)(void *data, size_t len, struct selinux_load_state *load_state);
 static int (*security_load_policy_compat_fn)(void *state, void *data, size_t len,
                                              struct selinux_load_state *load_state);
@@ -414,7 +412,6 @@ static bool g_selinux_ready;
 static bool g_dirty_policy_seen;
 static void *g_first_policydb;
 static u32 g_clean_access_count;
-static u32 g_policy_read_count;
 static void *g_clean_policy_blob;
 static size_t g_clean_policy_len;
 static bool g_clean_policy_has_magisk;
@@ -807,7 +804,6 @@ static bool clean_policydb_redirect_supported(void)
      * Relevant source paths:
      *   - security/selinux/ss/services.c
      *       context_struct_compute_av(struct policydb *policydb, ...)
-     *       security_read_policy(struct selinux_state *state, ...)
      *       security_context_to_sid(struct selinux_state *state, ...)
      *       security_load_policy(struct selinux_state *state, ...)
      *   - security/selinux/selinuxfs.c
@@ -855,14 +851,13 @@ static void log_bypass_once(const char *node, uid_t uid, const char *query)
 static bool selinux_compat_call_needed(void)
 {
     /*
-     * 4.14 参考源码里的 security_read_policy() / security_context_to_sid()
-     * 都需要 struct selinux_state * 作为第一个参数。这里用 selinux_state
+     * 4.14 参考源码里的 security_context_to_sid() 需要
+     * struct selinux_state * 作为第一个参数。这里用 selinux_state
      * 作为运行时信号，避免在没有 stateful ABI 的旧内核上误传参数。
      *
-     * security_read_policy() and security_context_to_sid() are stateful on the
-     * 4.14 sources listed above.  Keep the state argument through the Android
-     * common stateful era, and stop before the newer 6.4+ LSM refactors where
-     * this KPM has not been audited.
+     * security_context_to_sid() is stateful on the 4.14 sources listed above.
+     * Keep the state argument through the Android common stateful era, and stop
+     * before the newer 6.4+ LSM refactors where this KPM has not been audited.
      */
 	return g_selinux_state && selinux_state_arg_required();
 }
@@ -955,7 +950,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
     SYMBOL_CACHE_ENTRY("selinux_policy_cancel"),
-    SYMBOL_CACHE_ENTRY("security_read_policy"),
     SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
@@ -3915,59 +3909,6 @@ static void after_simple_read_from_buffer(hook_fargs5_t *a, void *u)
     copy_bytes(from, &a->local.data2, sizeof(g_clean_status_bytes));
 }
 
-static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data,
-                                               size_t *out_len)
-{
-    void *snapshot = READ_ONCE(g_clean_policy_blob);
-    size_t len = READ_ONCE(g_clean_policy_len);
-    void *copy;
-    u32 n;
-
-    if (!snapshot || !len || !out_data || !out_len)
-        return;
-    if (should_bypass_clean_filter(current_uid()))
-	{
-		log_bypass_once("policy", current_uid(), NULL);
-		return;
-	}
-
-    if (!vmalloc_fn) {
-        pr_warn("[selinux_hook] CLEAN policy read copy disabled: vmalloc unavailable\n");
-        return;
-    }
-
-    copy = vmalloc_fn(len);
-    if (!copy) {
-        pr_warn("[selinux_hook] CLEAN policy read copy alloc failed len=%zu; fallback=live\n",
-                len);
-        return;
-    }
-    copy_bytes(copy, snapshot, len);
-
-    *out_data = copy;
-    *out_len = len;
-
-    n = READ_ONCE(g_policy_read_count) + 1;
-    WRITE_ONCE(g_policy_read_count, n);
-
-    a->skip_origin = 1;
-    a->ret = 0;
-    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/policy read #%u uid=%d comm=%s blob=%px copy=%px len=%zu\n",
-                     n, current_uid(), current_comm(), snapshot, copy, len);
-}
-
-/* Hook: /sys/fs/selinux/policy read backend, security_read_policy(data, len) */
-static void before_security_read_policy(hook_fargs2_t *a, void *u)
-{
-    before_security_read_policy_common(a, (void **)a->arg0, (size_t *)a->arg1);
-}
-
-/* Hook: /sys/fs/selinux/policy read backend, security_read_policy(state, data, len) */
-static void before_security_read_policy_compat(hook_fargs3_t *a, void *u)
-{
-    before_security_read_policy_common(a, (void **)a->arg1, (size_t *)a->arg2);
-}
-
 static long init(const char *args, const char *event, void *__user r)
 {
     unsigned long addr;
@@ -4042,10 +3983,7 @@ static long init(const char *args, const char *event, void *__user r)
     type_attribute_bounds_av_fn = (void *)lookup_name_optional_suffix("type_attribute_bounds_av");
     selinux_policy_cancel_fn = (void *)lookup_name_optional_suffix("selinux_policy_cancel");
     selinux_policy_cancel_compat_fn = (void *)selinux_policy_cancel_fn;
-    security_read_policy_fn = (void *)lookup_name_optional_suffix("security_read_policy");
-    security_read_policy_compat_fn = (void *)security_read_policy_fn;
     log_symbol_addr("selinux_state", g_selinux_state);
-    log_symbol_addr("security_read_policy", (void *)security_read_policy_fn);
     log_symbol_addr("security_context_to_sid", (void *)security_context_to_sid_fn);
     log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
     log_symbol_addr("policydb_read", (void *)policydb_read_fn);
@@ -4065,22 +4003,9 @@ static long init(const char *args, const char *event, void *__user r)
     if (selinux_compat_call_needed())
         pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
                 kver, g_selinux_state);
-	/*
-     * 4.9 security_read_policy ABI is vendor-specific / 4.9 该 helper ABI 依机型变化：
-     * skip snapshot and hook on 4.9; non-4.9 keeps the existing clean-policy path.
-     */
-    if (!security_read_policy_fn)
-	{
-		pr_warn("[selinux_hook] cannot find security_read_policy, policy read hook disabled\n");
-	}
-    else if (selinux_49_compat_path())
-	{
-		pr_warn("[selinux_hook] skip security_read_policy snapshot on 4.9: helper ABI is device-specific\n");
-	}
-	else
-	{
-		snapshot_clean_policy("module_init");
-	}
+    /* Keep the clean policy snapshot available to procattr and AV filters. */
+    if (!selinux_49_compat_path())
+        snapshot_clean_policy("module_init");
     if (!security_context_to_sid_fn)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
@@ -4094,26 +4019,6 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] intel_av cannot find constraint_expr_eval, class constraints will be skipped\n");
     if (!type_attribute_bounds_av_fn)
         pr_warn("[selinux_hook] intel_av cannot find type_attribute_bounds_av, type bounds masking will be skipped\n");
-
-    if (security_read_policy_fn) {
-        /* Non-4.9 only / 仅非 4.9：4.9 不进入 g_hooks++，避免按错误 ABI hook。 */
-        if (!selinux_49_compat_path()) {
-            int argc = selinux_compat_call_needed() ? 3 : 2;
-
-            pr_info("[selinux_hook] hook security_read_policy argc=%d\n", argc);
-            if (selinux_compat_call_needed()) {
-                record_inline_hook((void *)security_read_policy_fn,
-                                   before_security_read_policy_compat, NULL);
-                hook_wrap((void *)security_read_policy_fn, 3, before_security_read_policy_compat, NULL, NULL);
-            } else {
-                record_inline_hook((void *)security_read_policy_fn,
-                                   before_security_read_policy, NULL);
-                hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
-            }
-        } else {
-            pr_info("[selinux_hook] skip security_read_policy hook on 4.9: helper ABI is device-specific\n");
-        }
-    }
 
     addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
     if (addr) {
