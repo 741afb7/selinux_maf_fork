@@ -2785,24 +2785,6 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
-    if (dirtysepolicy_access_should_deny(sample, sample_len)) {
-        n = READ_ONCE(g_clean_access_count) + 1;
-        WRITE_ONCE(g_clean_access_count, n);
-        a->local.data0 = 4;
-        a->local.data1 = n;
-        slot = n & (ACCESS_PROBE_SLOTS - 1);
-        a->local.data2 = slot;
-        g_probes[slot].id = n;
-        g_probes[slot].uid = uid;
-        g_probes[slot].node = "access";
-        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
-        pr_info("[selinux_hook] DIRTYSEPOLICY deny /sys/fs/selinux/access #%u uid=%d comm=%s query=\"%s\"\n",
-                n, uid, current_comm(), sample);
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
-        return;
-    }
-
     if (!clean_policydb_redirect_supported()) {
         snapshot_clean_policy("legacy_access");
         if (legacy_clean_query_should_block(sample, sample_len, true)) {
@@ -2879,24 +2861,6 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("context", uid, sample);
-        return;
-    }
-
-    if (dirtysepolicy_context_should_hide(sample)) {
-        n = READ_ONCE(g_clean_access_count) + 1;
-        WRITE_ONCE(g_clean_access_count, n);
-        a->local.data0 = 4;
-        a->local.data1 = n;
-        slot = n & (ACCESS_PROBE_SLOTS - 1);
-        a->local.data2 = slot;
-        g_probes[slot].id = n;
-        g_probes[slot].uid = uid;
-        g_probes[slot].node = "context";
-        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
-        pr_info("[selinux_hook] DIRTYSEPOLICY hide /sys/fs/selinux/context #%u uid=%d comm=%s query=\"%s\"\n",
-                n, uid, current_comm(), sample);
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
         return;
     }
 
