@@ -49,6 +49,7 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
+#define KP_AVD_CLEAN_SEQNO 1
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
 typedef enum {
@@ -2930,7 +2931,7 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     /* Patch seqno in the access response buffer to match /sys/fs/selinux/status */
     if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
-        ssize_t new_ret = patch_response_seqno(rbuf, live_ret, 1);
+        ssize_t new_ret = patch_response_seqno(rbuf, live_ret, KP_AVD_CLEAN_SEQNO);
         if (new_ret > 0) {
             live_ret = new_ret;
             a->ret = (uint64_t)new_ret;
