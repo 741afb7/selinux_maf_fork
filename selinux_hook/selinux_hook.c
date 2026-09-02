@@ -3,7 +3,7 @@
  *
  * The safe point for transaction queries is the selinuxfs write_op table,
  * where /sys/fs/selinux/access and /sys/fs/selinux/context still have the
- * original query text.  procattr writes are filtered at security_setprocattr().
+ * original query text.  procattr writes are filtered at selinux_setprocattr().
  * Returning -EINVAL for Magisk contexts matches the clean-policy behavior
  * where the Magisk type/context does not exist.
  */
@@ -431,7 +431,6 @@ static u32 g_bypass_context_log_count;
 static u32 g_bypass_policy_log_count;
 static u32 g_internal_policy_load_depth;
 static u32 g_procattr_current_count;
-static u32 g_setprocattr_probe_count;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_clean_policydb_av_disabled;
 static bool g_policydb_offset_fallback_warned;
@@ -501,7 +500,6 @@ static bool selinux_state_arg_required(void);
 static bool selinux_compat_call_needed(void);
 static bool policydb_offset_fallback_allowed(void);
 static bool write_op_slot_fallback_allowed(void);
-static bool security_setprocattr_has_lsm_arg(void);
 static void resolve_required_symbols_once(void);
 static void *lookup_name_optional_suffix(const char *base);
 static void log_symbol_addr(const char *name, const void *addr);
@@ -898,16 +896,6 @@ static bool write_op_slot_fallback_allowed(void)
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
 
-static bool security_setprocattr_has_lsm_arg(void)
-{
-    /*
-     * security/security.c:
-     *   < 5.4  security_setprocattr(name, value, size)
-     *   >=5.4  security_setprocattr(lsm, name, value, size)
-     */
-    return kver >= VERSION(5, 4, 0);
-}
-
 static bool security_load_policy_has_load_state(void)
 {
     /*
@@ -972,7 +960,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
     SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
-    SYMBOL_CACHE_ENTRY("security_setprocattr"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
     SYMBOL_CACHE_ENTRY("sel_write_context"),
@@ -3521,46 +3508,6 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     return blocked;
 }
 
-/* Hook: security_setprocattr(lsm, name, value, size) */
-static void before_security_setprocattr(hook_fargs4_t *a, void *u)
-{
-    const char *lsm = (const char *)a->arg0;
-    const char *name = (const char *)a->arg1;
-    const void *value = (const void *)a->arg2;
-    size_t size = (size_t)a->arg3;
-    u32 n;
-
-    n = READ_ONCE(g_setprocattr_probe_count);
-    if (n < 16) {
-        n++;
-        WRITE_ONCE(g_setprocattr_probe_count, n);
-        pr_info("[selinux_hook] PROBE security_setprocattr4 #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%px arg3=%zu\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
-                (void *)a->arg1, (void *)a->arg2, size);
-    }
-
-    if (str_eq_lit(lsm, "current")) {
-        if (!filter_procattr_current("security_setprocattr_compat3", NULL,
-                                     lsm, (const void *)a->arg1,
-                                     (size_t)a->arg2))
-            return;
-
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
-        return;
-    }
-
-    if (lsm && !str_eq_lit(lsm, "selinux"))
-        return;
-
-    if (!filter_procattr_current("security_setprocattr", lsm, name, value, size))
-        return;
-
-    a->skip_origin = 1;
-    a->ret = -EINVAL;
-}
-
-
 /*
  * Shared task-first setprocattr body / 共用的 task-first setprocattr 主体：
  * Polaris 4.9 passes (task, name, value, size), so arg0 is not lsm/name and the
@@ -3590,43 +3537,12 @@ static void before_task_setprocattr_49(hook_fargs4_t *a, const char *hook,
     a->ret = -EINVAL;
 }
 
-/* Hook: Xiaomi/Polaris 4.9 security_setprocattr(task, name, value, size) */
-static void before_security_setprocattr_task_49(hook_fargs4_t *a, void *u)
-{
-    before_task_setprocattr_49(a, "security_setprocattr_task_49",
-                               &g_setprocattr_probe_count);
-}
-
 /* Hook fallback: Xiaomi/Polaris 4.9 selinux_setprocattr(task, name, value, size) */
 
 static void before_selinux_setprocattr_task_49(hook_fargs4_t *a, void *u)
 {
     before_task_setprocattr_49(a, "selinux_setprocattr_task_49",
                                &g_selinux_setprocattr_probe_count);
-}
-
-/* Hook: legacy security_setprocattr(name, value, size) */
-static void before_security_setprocattr_legacy(hook_fargs3_t *a, void *u)
-{
-    const char *name = (const char *)a->arg0;
-    const void *value = (const void *)a->arg1;
-    size_t size = (size_t)a->arg2;
-    u32 n;
-
-    n = READ_ONCE(g_setprocattr_probe_count);
-    if (n < 16) {
-        n++;
-        WRITE_ONCE(g_setprocattr_probe_count, n);
-        pr_info("[selinux_hook] PROBE security_setprocattr3 #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
-                (void *)a->arg1, size);
-    }
-
-    if (!filter_procattr_current("security_setprocattr", NULL, name, value, size))
-        return;
-
-    a->skip_origin = 1;
-    a->ret = -EINVAL;
 }
 
 /* Hook fallback: selinux_setprocattr(name, value, size) */
@@ -4253,33 +4169,6 @@ static long init(const char *args, const char *event, void *__user r)
                   before_security_load_policy, after_security_load_policy, NULL);
     } else {
         selinux_hook_dbg("[selinux_hook] security_load_policy capture skipped; clean policy already loaded\n");
-    }
-
-    /* setprocattr ABI split / setprocattr ABI 分叉：4.9 是 task-first，其他内核走原签名探测。 */
-	addr = (unsigned long)lookup_name_optional_suffix("security_setprocattr");
-    if (addr) {
-        if (selinux_49_compat_path()) {
-            record_inline_hook((void *)addr,
-                               before_security_setprocattr_task_49, NULL);
-            selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=4 mode=task 4.9\n");
-            hook_wrap((void *)addr, 4, before_security_setprocattr_task_49, NULL, NULL);
-        } else {
-            bool setprocattr_lsm_arg = security_setprocattr_has_lsm_arg();
-
-            selinux_hook_dbg("[selinux_hook] hook security_setprocattr argc=%d\n",
-                             setprocattr_lsm_arg ? 4 : 3);
-            if (setprocattr_lsm_arg) {
-                record_inline_hook((void *)addr, before_security_setprocattr,
-                                   NULL);
-                hook_wrap((void *)addr, 4, before_security_setprocattr, NULL, NULL);
-            } else {
-                record_inline_hook((void *)addr,
-                                   before_security_setprocattr_legacy, NULL);
-                hook_wrap((void *)addr, 3, before_security_setprocattr_legacy, NULL, NULL);
-            }
-        }
-    } else {
-        pr_warn("[selinux_hook] cannot find security_setprocattr\n");
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
