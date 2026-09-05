@@ -50,13 +50,10 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
 typedef enum {
-    SEL_HOOK_STATE_FULL_FALLBACK = 0,
-    SEL_HOOK_STATE_PARTIAL_FALLBACK,
-    SEL_HOOK_STATE_NORMAL_K,  
-    SEL_HOOK_STATE_NORMAL_M   
+    SEL_HOOK_STATE_NORMAL = 0,
+    SEL_HOOK_STATE_POLICYDB_REQ,
+    SEL_HOOK_STATE_UNSUPORRT
 } sel_hook_state_t;
-
-static bool g_hook_context_compute_av_ok; // Retained for mode-reporting compatibility
 
 static void *g_funcs[24];
 static void *g_hook_befores[24];
@@ -112,7 +109,6 @@ static u32 g_bypass_context_log_count;
 
 static u32 g_bypass_policy_log_count;
 static u32 g_selinux_setprocattr_probe_count;
-static bool g_clean_policydb_av_disabled;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
@@ -2696,26 +2692,12 @@ static sel_hook_state_t module_get_working_mode(void) // Used to identify the wo
 {
     bool redirect_supported = clean_policydb_redirect_supported();
     bool has_clean_policydb = READ_ONCE(g_clean_policydb) != NULL;
-    bool has_clean_blob = READ_ONCE(g_clean_policy_blob) != NULL;
-    bool legacy_av_disabled = READ_ONCE(g_clean_policydb_av_disabled);
 
-    // NORMAL-K
-    if (redirect_supported && has_clean_policydb)
-        return SEL_HOOK_STATE_NORMAL_K;
-
-    // NORMAL-M
-    if (!redirect_supported &&
-        READ_ONCE(g_hook_context_compute_av_ok) &&
-        has_clean_policydb &&
-        !legacy_av_disabled)
-        return SEL_HOOK_STATE_NORMAL_M;
-
-    // PARTIAL
-    if (has_clean_blob || has_clean_policydb)
-        return SEL_HOOK_STATE_PARTIAL_FALLBACK;
-
-    // FULL
-    return SEL_HOOK_STATE_FULL_FALLBACK;
+    if (!redirect_supported)
+        return SEL_HOOK_STATE_UNSUPORRT;
+    if (!has_clean_policydb)
+        return SEL_HOOK_STATE_POLICYDB_REQ;
+    return SEL_HOOK_STATE_NORMAL;
 }
 
 static long control(const char* args, char* __user out_msg, int outlen)
@@ -2731,17 +2713,14 @@ static long control(const char* args, char* __user out_msg, int outlen)
     if (str_eq_lit(args, "mode")) {
         state = module_get_working_mode();
         switch (state) {
-        case SEL_HOOK_STATE_NORMAL_K:
-            state_str = "NORMAL-K";
+        case SEL_HOOK_STATE_NORMAL:
+            state_str = "NORMAL";
             break;
-        case SEL_HOOK_STATE_NORMAL_M:
-            state_str = "NORMAL-M";
+        case SEL_HOOK_STATE_POLICYDB_REQ:
+            state_str = "POLICYDB_REQ";
             break;
-        case SEL_HOOK_STATE_PARTIAL_FALLBACK:
-            state_str = "PARTIAL_FALLBACK";
-            break;
-        case SEL_HOOK_STATE_FULL_FALLBACK:
-            state_str = "FULL_FALLBACK";
+        case SEL_HOOK_STATE_UNSUPORRT:
+            state_str = "UNSUPORRT";
             break;
         default:
             state_str = "UNKNOWN";
