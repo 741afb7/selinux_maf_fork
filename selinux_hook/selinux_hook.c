@@ -177,7 +177,6 @@ static bool current_in_clean_eval_scope(void);
 static int install_write_op_hooks(void);
 static void record_inline_hook(void *func, void *before, void *after);
 static void uninstall_inline_hooks(void);
-static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u);
 static bool install_status_page_redirect(void);
 
@@ -526,7 +525,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
     SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
-    SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
     SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
@@ -1766,70 +1764,6 @@ static ssize_t copy_clean_status_to_user(char __user *buf, size_t count,
 }
 
 /*
- * Hook: /sys/fs/selinux/status mmap handler
- *
- * Android libselinux and detection tools access the status page via mmap(),
- * not read(). sel_read_handle_status is therefore never called. We hook
- * sel_mmap_handle_status instead and patch the sequence field in the mapped
- * page to keep it consistent with our spoofed read() path.
- *
- * struct selinux_kernel_status layout (20 bytes):
- *   u32 version;      offset  0
- *   u32 sequence;     offset  4  ← patch to clean value (0 or 4)
- *   u32 enforcing;    offset  8  (always 1; not patched)
- *   u32 policyload;   offset 12  ← patch to clean value (0 or 1)
- *   u32 deny_unknown; offset 16  (always 1; not patched)
- *
- * struct vm_area_struct vm_start offset:
- *   kernel < 6.1 (no PER_VMA_LOCK): offset 0
- *   kernel >= 6.1 (CONFIG_PER_VMA_LOCK): int(4)+pad(4)+ptr(8) = offset 16
- */
-static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u)
-{
-    void *vma;
-    unsigned long vm_start = 0;
-    unsigned long vm_start_off;
-    u32 n;
-
-    if ((int)a->ret != 0)
-        return;
-
-    vma = (void *)a->arg1;
-    if (!vma)
-        return;
-
-    /* vm_start offset depends on CONFIG_PER_VMA_LOCK presence */
-    vm_start_off = (kver >= VERSION(6, 1, 0)) ? 16 : 0;
-
-    if (!copy_from_kernel_nofault_fn ||
-        copy_from_kernel_nofault_fn(&vm_start, (char *)vma + vm_start_off,
-                                    sizeof(vm_start)) != 0)
-        return;
-
-    /* Sanity check: must look like a user virtual address */
-    if (!vm_start || vm_start < 0x10000UL || vm_start >= 0xffffff0000000000UL)
-        return;
-
-    /* Patch sequence (offset 4) and policyload (offset 12) in struct selinux_kernel_status */
-    if (copy_to_user_nofault_fn) {
-        unsigned char patch_bytes[4];
-        /* sequence at offset 4 */
-        put_u32_le(patch_bytes, get_u32_le(g_clean_status_bytes + 4));
-        copy_to_user_nofault_fn((void __user *)(vm_start + 4), patch_bytes, 4);
-        /* policyload at offset 12 */
-        put_u32_le(patch_bytes, get_u32_le(g_clean_status_bytes + 12));
-        copy_to_user_nofault_fn((void __user *)(vm_start + 12), patch_bytes, 4);
-    }
-
-    n = READ_ONCE(g_status_read_count) + 1;
-    WRITE_ONCE(g_status_read_count, n);
-    selinux_hook_dbg("[selinux_hook] STATUS mmap patch #%u uid=%d comm=%s vm_start=%lx seq=%u pload=%u\n",
-                     n, current_uid(), current_comm(), vm_start,
-                     get_u32_le(g_clean_status_bytes + 4),
-                     get_u32_le(g_clean_status_bytes + 12));
-}
-
-/*
  * Return a clean backing page when an app opens /sys/fs/selinux/status.
  * sel_open_handle_status() stores selinux_kernel_status_page()'s return value
  * in filp->private_data, so redirecting the page factory covers both the read
@@ -2192,19 +2126,7 @@ static long init(const char *args, const char *event, void *__user r)
     status_page_redirect = install_status_page_redirect();
     if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
     else pr_warn("[selinux_hook] status page redirect failed\n");
-
-    if(status_page_redirect == false)
-    {
-        /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
-        addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
-        if (addr) {
-            record_inline_hook((void *)addr, NULL, after_sel_mmap_handle_status);
-            selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
-            hook_wrap((void *)addr, 2, NULL, after_sel_mmap_handle_status, NULL);
-        } else {
-            pr_warn("[selinux_hook] cannot find sel_mmap_handle_status, status mmap patch skipped\n");
-        }
-    }
+    /* On failure, leave the kernel's native status mmap path untouched. */
 
     if (!security_load_policy_fn) {
         pr_warn("[selinux_hook] cannot find security_load_policy, deferred clean policy capture disabled\n");
