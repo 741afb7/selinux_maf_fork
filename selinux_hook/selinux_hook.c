@@ -40,7 +40,6 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define MAGISK_POLICY_REL_PATH ".magisk/selinux/load"
 #define MAGISK_POLICY_MAX_SIZE (8 * 1024 * 1024)
 #define CLEAN_EVAL_SCOPE_SLOTS 8
-#define STATUS_READ_SCOPE_SLOTS 8
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
@@ -58,9 +57,6 @@ static void *g_hook_befores[24];
 static void *g_hook_afters[24];
 static int g_hooks;
 static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
-static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t size);
-static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
-static const char *g_copy_to_user_name;
 static int (*security_load_policy_fn)(void *data, size_t len, struct selinux_load_state *load_state);
 static int (*security_context_to_sid_fn)(const char *scontext, u32 scontext_len, u32 *out_sid, gfp_t gfp);
 static int (*security_context_to_sid_compat_fn)(void *state, const char *scontext, u32 scontext_len,
@@ -97,10 +93,6 @@ static u32 g_bypass_context_log_count;
 
 static u32 g_bypass_policy_log_count;
 static u32 g_selinux_setprocattr_probe_count;
-static u32 g_status_read_count;
-static u32 g_status_probe_count;
-static u32 g_status_redirect_count;
-static bool g_simple_read_from_buffer_hooked;
 static bool g_policy_capture_in_progress;
 
 struct access_probe {
@@ -115,15 +107,8 @@ struct clean_eval_scope {
     u32 depth;
 };
 
-struct status_read_scope {
-    void *task;
-    u32 depth;
-    u32 patched;
-};
-
 static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
 static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
-static struct status_read_scope g_status_read_scopes[STATUS_READ_SCOPE_SLOTS];
 static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
 static void *g_fake_status_page;
 static bool g_status_page_redirect_hooked;
@@ -162,15 +147,6 @@ static void after_security_load_policy(hook_fargs4_t *a, void *u);
 static void try_load_clean_policydb_from_blob(const char *reason);
 static void before_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
 static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
-static void before_sel_read_handle_status(hook_fargs4_t *a, void *u);
-static void after_sel_read_handle_status(hook_fargs4_t *a, void *u);
-static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u);
-static void after_simple_read_from_buffer(hook_fargs5_t *a, void *u);
-static bool enter_status_read_scope(void);
-static void leave_status_read_scope(void);
-static bool current_in_status_read_scope(void);
-static void mark_status_read_scope_patched(void);
-static bool current_status_read_scope_patched(void);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
@@ -288,20 +264,6 @@ static size_t runtime_page_size(void)
     if (tg1 == 3)
         return 64 * 1024;
     return 4 * 1024;
-}
-
-static int copy_status_to_user(void __user *dst, const void *src, size_t len)
-{
-    int copied;
-
-    if (copy_to_user_nofault_fn)
-        return copy_to_user_nofault_fn(dst, src, len) ? -EFAULT : 0;
-
-    if (copy_to_user_raw_fn)
-        return copy_to_user_raw_fn(dst, src, len) ? -EFAULT : 0;
-
-    copied = compat_copy_to_user(dst, src, (int)len);
-    return copied == (int)len ? 0 : -EFAULT;
 }
 
 static void put_u32_le(unsigned char *dst, u32 value)
@@ -501,9 +463,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("_raw_spin_unlock"),
     SYMBOL_CACHE_ENTRY("copy_from_kernel_nofault"),
     SYMBOL_CACHE_ENTRY("probe_kernel_read"),
-    SYMBOL_CACHE_ENTRY("copy_to_user_nofault"),
-    SYMBOL_CACHE_ENTRY("_copy_to_user"),
-    SYMBOL_CACHE_ENTRY("__copy_to_user"),
     SYMBOL_CACHE_ENTRY("vmalloc"),
     SYMBOL_CACHE_ENTRY("vmalloc_noprof"),
     SYMBOL_CACHE_ENTRY("vmalloc_to_page"),
@@ -523,8 +482,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("cond_compute_av"),
     SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
-    SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
-    SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
@@ -1260,133 +1217,6 @@ static bool current_in_clean_eval_scope(void)
     return in_scope;
 }
 
-static bool enter_status_read_scope(void)
-{
-    void *task = current;
-    int empty = -1;
-    int i;
-    u32 depth;
-    bool entered = false;
-
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
-        if (g_status_read_scopes[i].task == task) {
-            depth = g_status_read_scopes[i].depth + 1;
-            g_status_read_scopes[i].depth = depth;
-            entered = true;
-            break;
-        }
-        if (empty < 0 && !g_status_read_scopes[i].task)
-            empty = i;
-    }
-
-    if (!entered) {
-        if (empty < 0) {
-            if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-            pr_warn("[selinux_hook] status read scope slots exhausted task=%px comm=%s\n",
-                    task, current_comm());
-            return false;
-        }
-        g_status_read_scopes[empty].task = task;
-        g_status_read_scopes[empty].depth = 1;
-        g_status_read_scopes[empty].patched = 0;
-        entered = true;
-    }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-    return true;
-}
-
-static void leave_status_read_scope(void)
-{
-    void *task = current;
-    int i;
-    u32 depth;
-
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
-        if (g_status_read_scopes[i].task != task)
-            continue;
-
-        depth = g_status_read_scopes[i].depth;
-        if (depth > 1) {
-            g_status_read_scopes[i].depth = depth - 1;
-        } else {
-            g_status_read_scopes[i].depth = 0;
-            g_status_read_scopes[i].patched = 0;
-            g_status_read_scopes[i].task = NULL;
-        }
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-        return;
-    }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-}
-
-static bool current_in_status_read_scope(void)
-{
-    void *task = current;
-    int i;
-    bool in_scope = false;
-
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
-        if (g_status_read_scopes[i].task == task &&
-            g_status_read_scopes[i].depth) {
-            in_scope = true;
-            break;
-        }
-    }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-    return in_scope;
-}
-
-static void mark_status_read_scope_patched(void)
-{
-    void *task = current;
-    int i;
-
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
-        if (g_status_read_scopes[i].task == task &&
-            g_status_read_scopes[i].depth) {
-            g_status_read_scopes[i].patched = 1;
-            if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-            return;
-        }
-    }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-}
-
-static bool current_status_read_scope_patched(void)
-{
-    void *task = current;
-    int i;
-    bool patched = false;
-
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < STATUS_READ_SCOPE_SLOTS; i++) {
-        if (g_status_read_scopes[i].task == task &&
-            g_status_read_scopes[i].depth) {
-            patched = g_status_read_scopes[i].patched != 0;
-            break;
-        }
-    }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-    return patched;
-}
-
 /* Hook: selinux_complete_init */
 static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
 {
@@ -1732,37 +1562,6 @@ static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
         leave_clean_eval_scope();
 }
 
-static ssize_t copy_clean_status_to_user(char __user *buf, size_t count,
-                                         loff_t *ppos)
-{
-    unsigned char status[SELINUX_STATUS_SIZE];
-    loff_t pos;
-    size_t avail;
-    int rc;
-
-    if (!buf || !ppos)
-        return -EINVAL;
-
-    pos = *ppos;
-    if (pos < 0)
-        return -EINVAL;
-    if (!count || pos >= (loff_t)sizeof(status))
-        return 0;
-
-    fill_clean_status_bytes(status);
-
-    avail = sizeof(status) - (size_t)pos;
-    if (count > avail)
-        count = avail;
-
-    rc = copy_status_to_user(buf, ((char *)&status) + pos, count);
-    if (rc)
-        return -EFAULT;
-
-    *ppos = pos + (loff_t)count;
-    return (ssize_t)count;
-}
-
 /*
  * Return a clean backing page when an app opens /sys/fs/selinux/status.
  * sel_open_handle_status() stores selinux_kernel_status_page()'s return value
@@ -1845,175 +1644,6 @@ static bool install_status_page_redirect(void)
     return true;
 }
 
-static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
-{
-    uid_t uid = current_uid();
-    ssize_t ret;
-    u32 n;
-    u32 probe;
-    loff_t pos_before = -1;
-    loff_t pos_after = -1;
-
-    a->local.data0 = 0;
-    a->local.data1 = 0;
-    a->local.data2 = 0;
-    a->local.data3 = 0;
-
-    if (should_bypass_clean_filter(uid))
-        return;
-
-    probe = READ_ONCE(g_status_probe_count) + 1;
-    WRITE_ONCE(g_status_probe_count, probe);
-    if (a->arg3) {
-        if (copy_from_kernel_nofault_fn &&
-            copy_from_kernel_nofault_fn(&pos_before, (void *)a->arg3,
-                                        sizeof(pos_before)) != 0)
-            pos_before = -2;
-        else if (!copy_from_kernel_nofault_fn)
-            pos_before = *(loff_t *)a->arg3;
-    }
-
-    if (READ_ONCE(g_simple_read_from_buffer_hooked) && enter_status_read_scope()) {
-        a->local.data0 = 1;
-        a->local.data1 = probe;
-        a->local.data2 = (uint64_t)pos_before;
-        a->local.data3 = uid;
-        return;
-    }
-
-    ret = copy_clean_status_to_user((char __user *)a->arg1,
-                                    (size_t)a->arg2,
-                                    (loff_t *)a->arg3);
-    if (a->arg3) {
-        if (copy_from_kernel_nofault_fn &&
-            copy_from_kernel_nofault_fn(&pos_after, (void *)a->arg3,
-                                        sizeof(pos_after)) != 0)
-            pos_after = -2;
-        else if (!copy_from_kernel_nofault_fn)
-            pos_after = *(loff_t *)a->arg3;
-    }
-
-    if (probe <= 16)
-        pr_info("[selinux_hook] STATUS probe #%u uid=%d comm=%s file=%px buf=%px count=%zu ppos=%px pos_before=%lld ret=%zd pos_after=%lld copy=%s clean_version=%u clean_sequence=%u clean_policyload=%u\n",
-                probe, uid, current_comm(), (void *)a->arg0,
-                (void *)a->arg1, (size_t)a->arg2, (void *)a->arg3,
-                pos_before, ret, pos_after, g_copy_to_user_name ?: "compat_copy_to_user",
-                SELINUX_KERNEL_STATUS_VERSION,
-                SELINUX_STATUS_CLEAN_SEQUENCE,
-                SELINUX_STATUS_CLEAN_POLICYLOAD);
-
-    if (ret < 0)
-        return;
-
-    n = READ_ONCE(g_status_read_count) + 1;
-    WRITE_ONCE(g_status_read_count, n);
-
-    a->skip_origin = 1;
-    a->ret = (uint64_t)ret;
-    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%d comm=%s ret=%zd sequence=%u policyload=%u copy=%s\n",
-                     n, uid, current_comm(), ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD,
-                     g_copy_to_user_name ?: "compat_copy_to_user");
-}
-
-static void after_sel_read_handle_status(hook_fargs4_t *a, void *u)
-{
-    loff_t pos_after = -1;
-    u32 probe;
-    u32 n;
-    bool patched;
-
-    if (!a->local.data0)
-        return;
-
-    if (a->arg3) {
-        if (copy_from_kernel_nofault_fn &&
-            copy_from_kernel_nofault_fn(&pos_after, (void *)a->arg3,
-                                        sizeof(pos_after)) != 0)
-            pos_after = -2;
-        else if (!copy_from_kernel_nofault_fn)
-            pos_after = *(loff_t *)a->arg3;
-    }
-
-    patched = current_status_read_scope_patched();
-    leave_status_read_scope();
-
-    probe = (u32)a->local.data1;
-    if (probe <= 16)
-        pr_info("[selinux_hook] STATUS probe #%u uid=%u comm=%s mode=simple_read ret=%ld pos_before=%lld pos_after=%lld\n",
-                probe, (u32)a->local.data3, current_comm(), (long)a->ret,
-                (loff_t)a->local.data2, pos_after);
-
-    if (!patched || (long)a->ret < 0)
-        return;
-
-    n = READ_ONCE(g_status_read_count) + 1;
-    WRITE_ONCE(g_status_read_count, n);
-    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%u comm=%s mode=simple_read ret=%ld sequence=%u policyload=%u\n",
-                     n, (u32)a->local.data3, current_comm(), (long)a->ret,
-                     SELINUX_STATUS_CLEAN_SEQUENCE,
-                     SELINUX_STATUS_CLEAN_POLICYLOAD);
-}
-
-static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
-{
-    unsigned char *from;
-    u32 n;
-
-    a->local.data0 = 0;
-
-    if (!current_in_status_read_scope())
-        return;
-    if ((size_t)a->arg4 != sizeof(g_clean_status_bytes))
-        return;
-
-    from = (unsigned char *)a->arg3;
-    if (!from)
-        return;
-
-    copy_bytes(&a->local.data2, from, sizeof(g_clean_status_bytes));
-    copy_bytes(from, g_clean_status_bytes, sizeof(g_clean_status_bytes));
-    mark_status_read_scope_patched();
-
-    a->local.data0 = 1;
-    a->local.data1 = (uint64_t)from;
-
-    n = READ_ONCE(g_status_redirect_count) + 1;
-    WRITE_ONCE(g_status_redirect_count, n);
-    if (n <= 16)
-        pr_info("[selinux_hook] STATUS v3 simple_read patch #%u uid=%d comm=%s to=%px count=%zu ppos=%px from=%px available=%zu old=%u,%u,%u,%u,%u clean=%u,%u,%u,%u,%u bytes=%02x %02x %02x %02x\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
-                (size_t)a->arg1, (void *)a->arg2, from,
-                (size_t)a->arg4,
-                get_u32_le((unsigned char *)&a->local.data2 + 0),
-                get_u32_le((unsigned char *)&a->local.data2 + 4),
-                get_u32_le((unsigned char *)&a->local.data2 + 8),
-                get_u32_le((unsigned char *)&a->local.data2 + 12),
-                get_u32_le((unsigned char *)&a->local.data2 + 16),
-                get_u32_le(g_clean_status_bytes + 0),
-                get_u32_le(g_clean_status_bytes + 4),
-                get_u32_le(g_clean_status_bytes + 8),
-                get_u32_le(g_clean_status_bytes + 12),
-                get_u32_le(g_clean_status_bytes + 16),
-                g_clean_status_bytes[0], g_clean_status_bytes[1],
-                g_clean_status_bytes[2], g_clean_status_bytes[3]);
-}
-
-static void after_simple_read_from_buffer(hook_fargs5_t *a, void *u)
-{
-    unsigned char *from;
-
-    if (!a->local.data0)
-        return;
-
-    from = (unsigned char *)a->local.data1;
-    if (!from)
-        return;
-
-    copy_bytes(from, &a->local.data2, sizeof(g_clean_status_bytes));
-}
-
 static long init(const char *args, const char *event, void *__user r)
 {
     unsigned long addr;
@@ -2049,21 +1679,6 @@ static long init(const char *args, const char *event, void *__user r)
     copy_from_kernel_nofault_fn = (void *)lookup_name_optional_suffix("copy_from_kernel_nofault");
     if (!copy_from_kernel_nofault_fn)
         copy_from_kernel_nofault_fn = (void *)lookup_name_optional_suffix("probe_kernel_read");
-    copy_to_user_nofault_fn = (void *)lookup_name_optional_suffix("copy_to_user_nofault");
-    if (copy_to_user_nofault_fn) {
-        g_copy_to_user_name = "copy_to_user_nofault";
-    } else {
-        copy_to_user_raw_fn = (void *)lookup_name_optional_suffix("_copy_to_user");
-        if (copy_to_user_raw_fn) {
-            g_copy_to_user_name = "_copy_to_user";
-        } else {
-            copy_to_user_raw_fn = (void *)lookup_name_optional_suffix("__copy_to_user");
-            if (copy_to_user_raw_fn)
-                g_copy_to_user_name = "__copy_to_user";
-        }
-    }
-    if (!copy_to_user_nofault_fn && !copy_to_user_raw_fn)
-        pr_warn("[selinux_hook] cannot find raw copy_to_user, status hook will use compat_copy_to_user fallback\n");
     vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc");
     if (!vmalloc_fn)
         vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc_noprof");
@@ -2099,29 +1714,6 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean-policy redirect unavailable\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
         pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, clean policydb redirect disabled\n");
-    addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
-    if (addr) {
-        record_inline_hook((void *)addr, before_simple_read_from_buffer,
-                           after_simple_read_from_buffer);
-        WRITE_ONCE(g_simple_read_from_buffer_hooked, true);
-        selinux_hook_dbg("[selinux_hook] hook simple_read_from_buffer argc=5 for status patch\n");
-        hook_wrap((void *)addr, 5, before_simple_read_from_buffer,
-                  after_simple_read_from_buffer, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find simple_read_from_buffer, status hook will use direct user copy fallback\n");
-    }
-
-    addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
-    if (addr) {
-        record_inline_hook((void *)addr, before_sel_read_handle_status,
-                           after_sel_read_handle_status);
-        selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4\n");
-        hook_wrap((void *)addr, 4, before_sel_read_handle_status,
-                  after_sel_read_handle_status, NULL);
-    } else {
-        pr_warn("[selinux_hook] cannot find sel_read_handle_status, status read hook skipped\n");
-    }
-
     bool status_page_redirect = false;
     status_page_redirect = install_status_page_redirect();
     if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
