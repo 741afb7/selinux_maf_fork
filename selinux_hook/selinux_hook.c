@@ -1,7 +1,7 @@
 /*
  * Audit and filter SELinux access queries that probe Magisk contexts.
  *
- * The safe point for transaction queries is the selinuxfs write_op table,
+ * Transaction queries are filtered at the direct selinuxfs write handlers,
  * where /sys/fs/selinux/access and /sys/fs/selinux/context still have the
  * original query text.  procattr writes are filtered at selinux_setprocattr().
  * Returning -EINVAL for Magisk contexts matches the clean-policy behavior
@@ -41,8 +41,6 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define MAGISK_POLICY_MAX_SIZE (8 * 1024 * 1024)
 #define CLEAN_EVAL_SCOPE_SLOTS 8
 #define STATUS_READ_SCOPE_SLOTS 8
-#define SEL_WRITE_OP_CONTEXT 5
-#define SEL_WRITE_OP_ACCESS 6
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
@@ -59,16 +57,6 @@ static void *g_funcs[24];
 static void *g_hook_befores[24];
 static void *g_hook_afters[24];
 static int g_hooks;
-struct file;
-typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
-extern unsigned long *pgtable_entry(unsigned long pgd, unsigned long va);
-static sel_write_op_fn *g_write_op_access_slot;
-static sel_write_op_fn *g_write_op_context_slot;
-static sel_write_op_fn g_orig_write_op_access;
-static sel_write_op_fn g_orig_write_op_context;
-static bool g_write_op_access_patched;
-static bool g_write_op_context_patched;
-static bool g_write_op_install_deferred;
 static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
 static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t size);
 static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
@@ -163,7 +151,6 @@ static bool use_legacy_clean_blob_query(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_state_arg_required(void);
 static bool selinux_compat_call_needed(void);
-static bool write_op_slot_fallback_allowed(void);
 static void resolve_required_symbols_once(void);
 static void *lookup_name_optional_suffix(const char *base);
 static void log_symbol_addr(const char *name, const void *addr);
@@ -187,14 +174,9 @@ static bool current_status_read_scope_patched(void);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
-static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size);
-static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size);
-static int install_write_op_hooks(bool allow_slot_fallback);
-static void uninstall_write_op_hooks(void);
+static int install_write_op_hooks(void);
 static void record_inline_hook(void *func, void *before, void *after);
 static void uninstall_inline_hooks(void);
-static bool event_is_post_init(const char *event);
-static void try_complete_deferred_write_op_install(const char *reason);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u);
 static bool install_status_page_redirect(void);
@@ -442,7 +424,7 @@ static bool clean_policydb_redirect_supported(void)
      *       security_context_to_sid(struct selinux_state *state, ...)
      *       security_load_policy(struct selinux_state *state, ...)
      *   - security/selinux/selinuxfs.c
-     *       sel_write_access(), sel_write_context(), write_op[]
+     *       sel_write_access(), sel_write_context()
      *
      * 这里的 4.14 适配不是单纯按 kver 猜 ABI，而是用上述 cepheus/sm8150
       * 4.14 源码确认 SELinux helper 的真实签名。只要运行时能解析到
@@ -502,15 +484,6 @@ static bool selinux_state_arg_required(void)
     return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
 }
 
-static bool write_op_slot_fallback_allowed(void)
-{
-    /*
-     * The audited stateful 4.14 layout has the same context/access slots as
-     * newer kernels. Keep unknown layouts off the pointer-table path.
-     */
-    return !use_legacy_clean_blob_query() || g_selinux_state;
-}
-
 struct symbol_cache_entry {
     const char *base;
     size_t len;
@@ -558,7 +531,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
     SYMBOL_CACHE_ENTRY("sel_write_context"),
-    SYMBOL_CACHE_ENTRY("write_op"),
     SYMBOL_CACHE_ENTRY("context_struct_compute_av"),
     SYMBOL_CACHE_ENTRY("string_to_context_struct"),
     SYMBOL_CACHE_ENTRY("selinux_complete_init"),
@@ -1423,7 +1395,6 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
     WRITE_ONCE(g_selinux_ready, true);
     selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
     snapshot_clean_policy("complete_init");
-	try_complete_deferred_write_op_install("complete_init");
 }
 
 /* Hook: selinux_policy_commit */
@@ -1433,73 +1404,6 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
     selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policydb=%px clean policydb=%px\n",
                      g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
-	try_complete_deferred_write_op_install("policy_commit");
-}
-
-/*
- * Determine whether the current KP event is past the pre-kernel-init stage.
- * write_op[] slot hooks must not be installed during pre-kernel-init: the
- * kernel's selinux_complete_init() can rewrite that table afterwards. Direct
- * inline hooks target function text and are safe to install immediately; only
- * the pointer-table fallback is deferred until SELinux is ready.
- */
-static bool event_is_post_init(const char *event)
-{
-    const char * const pre = "pre-kernel-init";
-    const char *p = pre;
-
-    if (!event)
-        return true;
-    /*
-     * Compare byte-by-byte against "pre-kernel-init" without invoking the
-     * out-of-line strcmp() libcall, which is unavailable in the KPM loader.
-     */
-    while (*p && *event && *p == *event) {
-        p++;
-        event++;
-    }
-    if (*p == '\0' && *event == '\0')
-        return false;
-    return true;
-}
-
-/*
- * Complete a previously deferred install_write_op_hooks() now that SELinux
- * is ready.  Idempotent: install_write_op_hooks() itself is guarded by
- * g_write_op_access_patched / g_write_op_context_patched, so repeated calls
- * (after_selinux_policy_commit fires multiple times during boot) are no-ops
- * after the first successful install.
- */
-static void try_complete_deferred_write_op_install(const char *reason)
-{
-    int rc;
-
-    if (!clean_policydb_redirect_supported()) {
-        WRITE_ONCE(g_write_op_install_deferred, false);
-        return;
-    }
-    if (!READ_ONCE(g_write_op_install_deferred))
-        return;
-    if (READ_ONCE(g_write_op_access_patched) ||
-        READ_ONCE(g_write_op_context_patched))
-        return;
-
-    WRITE_ONCE(g_write_op_install_deferred, false);
-    rc = install_write_op_hooks(true);
-    if (rc == -EOPNOTSUPP) {
-        pr_warn("[selinux_hook] deferred write_op slot hooks unavailable reason=%s\n",
-                reason ? reason : "(null)");
-        return;
-    }
-    if (rc) {
-        /* Restore the deferred flag so a later policy_commit can retry. */
-        WRITE_ONCE(g_write_op_install_deferred, true);
-        pr_warn("[selinux_hook] deferred install_write_op_hooks failed reason=%s rc=%d\n",
-                reason ? reason : "(null)", rc);
-        return;
-    }
-    pr_info("[selinux_hook] deferred install_write_op_hooks completed reason=%s\n",
-            reason ? reason : "(null)");
 }
 
 static void before_policydb_arg0(hook_fargs6_t *a, void *u)
@@ -1586,7 +1490,6 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
         }
     }
 
-    try_complete_deferred_write_op_install("context_struct_compute_av");
 }
 
 /* Hook: /sys/fs/selinux/access write handler */
@@ -1619,7 +1522,7 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
-    /* Run the original selinuxfs write_op under the current task's clean scope. */
+    /* Run the original selinuxfs write handler under the current task's clean scope. */
     a->local.data0 = 3;
     a->local.data1 = n;
     slot = n & (ACCESS_PROBE_SLOTS - 1);
@@ -1723,302 +1626,64 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
                      probe->query);
 }
 
-#define SELINUX_PTE_VALID (1UL << 0)
-#define SELINUX_PTE_TABLE_BIT (1UL << 1)
-#define SELINUX_PTE_RDONLY (1UL << 7)
-#define SELINUX_PTE_DBM (1UL << 51)
-#define SELINUX_PTE_CONT (1UL << 52)
-#define SELINUX_CONT_PTES 16
-
-static unsigned long selinux_tlbi_vaddr(unsigned long addr)
-{
-    unsigned long v = addr >> 12;
-
-    v &= ((1UL << 44) - 1);
-    return v;
-}
-
-static void selinux_flush_tlb_kernel_page(unsigned long addr)
-{
-    addr = selinux_tlbi_vaddr(addr);
-    asm volatile("dsb ishst\n"
-                 "tlbi vaale1is, %0\n"
-                 "dsb ish\n"
-                 "isb\n"
-                 :
-                 : "r"(addr)
-                 : "memory");
-}
-
-static bool selinux_pte_valid_cont(unsigned long pte)
-{
-    return (pte & (SELINUX_PTE_VALID | SELINUX_PTE_TABLE_BIT | SELINUX_PTE_CONT)) ==
-           (SELINUX_PTE_VALID | SELINUX_PTE_TABLE_BIT | SELINUX_PTE_CONT);
-}
-
-static void *lookup_kernel_pgd(void)
-{
-    void *pgd;
-
-    pgd = lookup_name_optional_suffix("swapper_pg_dir");
-    if (!pgd)
-        pgd = lookup_name_optional_suffix("init_pg_dir");
-    return pgd;
-}
-
-static int patch_kernel_ulong(void *addr, unsigned long value)
-{
-    unsigned long saved[SELINUX_CONT_PTES];
-    unsigned long *pgd;
-    unsigned long *pte;
-    unsigned long *base;
-    int count;
-    int i;
-
-    if (!addr)
-        return -EINVAL;
-
-    pgd = (unsigned long *)lookup_kernel_pgd();
-    if (!pgd)
-        return -ENOENT;
-
-    pte = pgtable_entry((unsigned long)pgd, (unsigned long)addr);
-    if (!pte)
-        return -EFAULT;
-
-    if (!READ_ONCE(*pte))
-        return -EFAULT;
-
-    if (selinux_pte_valid_cont(READ_ONCE(*pte))) {
-        base = (unsigned long *)((unsigned long)pte & ~(sizeof(*pte) * SELINUX_CONT_PTES - 1));
-        count = SELINUX_CONT_PTES;
-    } else {
-        base = pte;
-        count = 1;
-    }
-
-    for (i = 0; i < count; i++) {
-        saved[i] = READ_ONCE(base[i]);
-        WRITE_ONCE(base[i], (saved[i] | SELINUX_PTE_DBM) & ~SELINUX_PTE_RDONLY);
-    }
-    selinux_flush_tlb_kernel_page((unsigned long)addr);
-
-    WRITE_ONCE(*(unsigned long *)addr, value);
-
-    for (i = 0; i < count; i++)
-        WRITE_ONCE(base[i], saved[i]);
-    selinux_flush_tlb_kernel_page((unsigned long)addr);
-
-    return 0;
-}
-
-static int hotpatch_write_op_slot(sel_write_op_fn *slot, sel_write_op_fn value,
-                                  sel_write_op_fn *old_value)
-{
-    unsigned long old_raw;
-    unsigned long new_raw;
-
-    if (!slot || !value)
-        return -EINVAL;
-
-    old_raw = (unsigned long)READ_ONCE(*slot);
-    new_raw = (unsigned long)value;
-    if (old_value)
-        *old_value = (sel_write_op_fn)old_raw;
-
-    return patch_kernel_ulong(slot, new_raw);
-}
-
-static ssize_t run_sel_write_op_filter(const char *node, sel_write_op_fn origin,
-                                       void (*before)(hook_fargs4_t *a, void *u),
-                                       struct file *file, char *buf, size_t size)
-{
-    hook_fargs4_t a;
-
-    zero_bytes(&a, sizeof(a));
-    a.arg0 = (uint64_t)file;
-    a.arg1 = (uint64_t)buf;
-    a.arg2 = (uint64_t)size;
-
-    before(&a, NULL);
-    if (!a.skip_origin) {
-        if (!origin) {
-            pr_warn("[selinux_hook] missing original write_op for %s\n", node ?: "?");
-            a.ret = -EINVAL;
-        } else {
-            a.ret = (uint64_t)origin((struct file *)a.arg0, (char *)a.arg1, (size_t)a.arg2);
-        }
-    }
-    after_sel_write_common(&a, NULL);
-
-    return (ssize_t)a.ret;
-}
-
-static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size)
-{
-    return run_sel_write_op_filter("access", g_orig_write_op_access,
-                                   before_sel_write_access, file, buf, size);
-}
-
-static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size)
-{
-    return run_sel_write_op_filter("context", g_orig_write_op_context,
-                                   before_sel_write_context, file, buf, size);
-}
-
-static int install_write_op_hooks(bool allow_slot_fallback)
+static int install_write_op_hooks(void)
 {
     unsigned long addr_access, addr_context;
-    sel_write_op_fn *write_op;
     hook_err_t hook_err;
-    int rc;
 
     if (!clean_policydb_redirect_supported())
         return -EOPNOTSUPP;
 
-    if (READ_ONCE(g_write_op_access_patched) ||
-        READ_ONCE(g_write_op_context_patched))
-        return 0;
-
-    /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
+    /* Direct symbols are required; no pointer-table fallback is available. */
     addr_access = (unsigned long)lookup_name_optional_suffix("sel_write_access");
     addr_context = (unsigned long)lookup_name_optional_suffix("sel_write_context");
     log_symbol_addr("sel_write_access", (void *)addr_access);
     log_symbol_addr("sel_write_context", (void *)addr_context);
 
-    /* Use direct symbols first, then the audited generic write_op fallback. */
-    if (addr_access) {
-        if (g_hooks + (addr_context ? 2 : 1) >
-            (int)(sizeof(g_funcs) / sizeof(g_funcs[0])))
-            return -ENOSPC;
-
-        pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
-        hook_err = hook_wrap((void *)addr_access, 3, before_sel_write_access,
-                             after_sel_write_common, NULL);
-        if (hook_err != HOOK_NO_ERR) {
-            pr_err("[selinux_hook] hook sel_write_access failed err=%d\n",
-                   (int)hook_err);
-            return (int)hook_err;
-        }
-        record_inline_hook((void *)addr_access, before_sel_write_access,
-                           after_sel_write_common);
-        selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
-
-        if (addr_context) {
-            pr_info("[selinux_hook] hook sel_write_context argc=3 mode=direct\n");
-            hook_err = hook_wrap((void *)addr_context, 3,
-                                 before_sel_write_context,
-                                 after_sel_write_common, NULL);
-            if (hook_err != HOOK_NO_ERR) {
-                pr_err("[selinux_hook] hook sel_write_context failed err=%d\n",
-                       (int)hook_err);
-                hook_unwrap((void *)addr_access, before_sel_write_access,
-                            after_sel_write_common);
-                g_hooks--;
-                g_funcs[g_hooks] = NULL;
-                g_hook_befores[g_hooks] = NULL;
-                g_hook_afters[g_hooks] = NULL;
-                return (int)hook_err;
-            }
-            record_inline_hook((void *)addr_context, before_sel_write_context,
-                               after_sel_write_common);
-            selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
-        } else {
-            pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
-        }
-        return 0;
-    }
-
-    if (!allow_slot_fallback)
-        return -EAGAIN;
-
-    /*
-     * write_op[] fallback notes:
-     *
-     * The referenced 4.14 selinuxfs.c trees confirm:
-     *   SEL_CONTEXT == 5
-     *   SEL_ACCESS  == 6
-     *
-     * Older builds patched write_op[5]/write_op[6] with hotpatch_nosync when
-     * direct sel_write_access()/sel_write_context() symbols were missing.
-     * The APatch bugreport captured on this cepheus device shows:
-     *   KernelPatch Version: c02
-     *   KP E unknown symbol: hotpatch_nosync
-     *   KP load kpm: selinux_magisk_access_filter, rc: -2
-     *
-     * This build avoids importing hotpatch_nosync so it can still load on c02.
-     * The fallback below patches only the audited write_op slots through the
-     * local page-table helper after SELinux initialization has completed.
-     */
-    if (!write_op_slot_fallback_allowed()) {
-        pr_warn("[selinux_hook] sel_write_access unresolved; no audited write_op[%d/%d] fallback kver=%x\n",
-                SEL_WRITE_OP_CONTEXT, SEL_WRITE_OP_ACCESS, kver);
+    if (!addr_access) {
+        pr_warn("[selinux_hook] sel_write_access unresolved; direct access/context hooks unavailable\n");
         return -EOPNOTSUPP;
     }
 
-    write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
-    log_symbol_addr("write_op", write_op);
-    if (!write_op) {
-        pr_err("[selinux_hook] cannot find sel_write_access or write_op\n");
-        return -ENOENT;
+    if (g_hooks + (addr_context ? 2 : 1) >
+        (int)(sizeof(g_funcs) / sizeof(g_funcs[0])))
+        return -ENOSPC;
+
+    pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
+    hook_err = hook_wrap((void *)addr_access, 3, before_sel_write_access,
+                         after_sel_write_common, NULL);
+    if (hook_err != HOOK_NO_ERR) {
+        pr_err("[selinux_hook] hook sel_write_access failed err=%d\n",
+               (int)hook_err);
+        return (int)hook_err;
     }
+    record_inline_hook((void *)addr_access, before_sel_write_access,
+                       after_sel_write_common);
+    selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
 
-    g_write_op_context_slot = &write_op[SEL_WRITE_OP_CONTEXT];
-    g_write_op_access_slot = &write_op[SEL_WRITE_OP_ACCESS];
-
-    if (!READ_ONCE(*g_write_op_access_slot)) {
-        pr_err("[selinux_hook] write_op access slot is empty\n");
-        return -ENOENT;
-    }
-
-    rc = hotpatch_write_op_slot(g_write_op_access_slot, hooked_sel_write_access,
-                                &g_orig_write_op_access);
-    if (rc) {
-        pr_err("[selinux_hook] patch write_op access failed rc=%d\n", rc);
-        return rc;
-    }
-    g_write_op_access_patched = true;
-
-    if (READ_ONCE(*g_write_op_context_slot)) {
-        rc = hotpatch_write_op_slot(g_write_op_context_slot, hooked_sel_write_context,
-                                    &g_orig_write_op_context);
-        if (rc) {
-            pr_err("[selinux_hook] patch write_op context failed rc=%d\n", rc);
-            uninstall_write_op_hooks();
-            return rc;
+    if (addr_context) {
+        pr_info("[selinux_hook] hook sel_write_context argc=3 mode=direct\n");
+        hook_err = hook_wrap((void *)addr_context, 3,
+                             before_sel_write_context,
+                             after_sel_write_common, NULL);
+        if (hook_err != HOOK_NO_ERR) {
+            pr_err("[selinux_hook] hook sel_write_context failed err=%d\n",
+                   (int)hook_err);
+            hook_unwrap((void *)addr_access, before_sel_write_access,
+                        after_sel_write_common);
+            g_hooks--;
+            g_funcs[g_hooks] = NULL;
+            g_hook_befores[g_hooks] = NULL;
+            g_hook_afters[g_hooks] = NULL;
+            return (int)hook_err;
         }
-        g_write_op_context_patched = true;
+        record_inline_hook((void *)addr_context, before_sel_write_context,
+                           after_sel_write_common);
+        selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
     } else {
-        pr_warn("[selinux_hook] write_op context slot is empty\n");
+        pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
     }
-
-    selinux_hook_dbg("[selinux_hook] write_op hooks installed access=%px->%px context=%px->%px\n",
-                     g_orig_write_op_access, hooked_sel_write_access,
-                     g_orig_write_op_context, hooked_sel_write_context);
     return 0;
-}
-
-static void uninstall_write_op_hooks(void)
-{
-    int rc;
-
-    if (g_write_op_context_patched && g_write_op_context_slot && g_orig_write_op_context) {
-        rc = hotpatch_write_op_slot(g_write_op_context_slot, g_orig_write_op_context, NULL);
-        if (rc)
-            pr_warn("[selinux_hook] restore write_op context failed rc=%d\n", rc);
-    }
-    g_write_op_context_patched = false;
-    g_write_op_context_slot = NULL;
-    g_orig_write_op_context = NULL;
-
-    if (g_write_op_access_patched && g_write_op_access_slot && g_orig_write_op_access) {
-        rc = hotpatch_write_op_slot(g_write_op_access_slot, g_orig_write_op_access, NULL);
-        if (rc)
-            pr_warn("[selinux_hook] restore write_op access failed rc=%d\n", rc);
-    }
-    g_write_op_access_patched = false;
-    g_write_op_access_slot = NULL;
-    g_orig_write_op_access = NULL;
 }
 
 static void record_inline_hook(void *func, void *before, void *after)
@@ -2488,10 +2153,9 @@ static long init(const char *args, const char *event, void *__user r)
     log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
     log_symbol_addr("policydb_read", (void *)policydb_read_fn);
     log_symbol_addr("policydb_destroy", (void *)policydb_destroy_fn);
-    pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d write_op_fallback=%d\n",
+    pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d\n",
             selinux_compat_call_needed() ? 1 : 0,
-            clean_policydb_redirect_supported() ? 1 : 0,
-            write_op_slot_fallback_allowed() ? 1 : 0);
+            clean_policydb_redirect_supported() ? 1 : 0);
     if (selinux_compat_call_needed())
         pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
                 kver, g_selinux_state);
@@ -2573,20 +2237,14 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     if (clean_policydb_redirect_supported()) {
-        rc = install_write_op_hooks(event_is_post_init(event) ||
-                                    READ_ONCE(g_selinux_ready));
-        if (rc == -EAGAIN) {
-            pr_info("[selinux_hook] deferring write_op slot hooks until SELinux ready (event=%s)\n",
-                    event ? event : "(null)");
-            WRITE_ONCE(g_write_op_install_deferred, true);
-        } else if (rc == -EOPNOTSUPP) {
-            pr_warn("[selinux_hook] write_op slot hooks unavailable; continuing without access/context redirect\n");
+        rc = install_write_op_hooks();
+        if (rc == -EOPNOTSUPP) {
+            pr_warn("[selinux_hook] direct selinuxfs write hooks unavailable; continuing without access/context redirect\n");
         } else if (rc) {
             uninstall_inline_hooks();
             return rc;
         }
     } else {
-        WRITE_ONCE(g_write_op_install_deferred, false);
         selinux_hook_dbg("[selinux_hook] skip /access and /context hooks; policydb redirect unsupported\n");
     }
 
@@ -2645,8 +2303,6 @@ static long init(const char *args, const char *event, void *__user r)
 
 static long exit_(void *__user r)
 {
-    WRITE_ONCE(g_write_op_install_deferred, false);
-    uninstall_write_op_hooks();
     uninstall_inline_hooks();
 
     /*
