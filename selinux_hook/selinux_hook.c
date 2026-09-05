@@ -56,7 +56,7 @@ typedef enum {
     SEL_HOOK_STATE_NORMAL_M   
 } sel_hook_state_t;
 
-static bool g_hook_context_compute_av_ok; // Legacy AV hook attachment status flag, used to identify the working mode
+static bool g_hook_context_compute_av_ok; // Retained for mode-reporting compatibility
 
 static void *g_funcs[24];
 static void *g_hook_befores[24];
@@ -86,311 +86,8 @@ struct policy_file {
     size_t len;
 };
 
-struct flex_array;
-struct hashtab;
-
-struct symtab {
-    struct hashtab *table;
-    u32 nprim;
-};
-
-enum {
-    SELINUX_EBITMAP_NODE_SIZE = 64,
-    SELINUX_EBITMAP_UNIT_BITS = sizeof(unsigned long) * 8,
-    SELINUX_EBITMAP_UNIT_NUMS =
-        (SELINUX_EBITMAP_NODE_SIZE - sizeof(void *) - sizeof(u32)) /
-        sizeof(unsigned long),
-};
-
-struct ebitmap_node {
-    struct ebitmap_node *next;
-    unsigned long maps[SELINUX_EBITMAP_UNIT_NUMS];
-    u32 startbit;
-};
-
-struct ebitmap {
-    struct ebitmap_node *node;
-    u32 highbit;
-};
-
-struct mls_level {
-    u32 sens;
-    struct ebitmap cat;
-};
-
-struct mls_range {
-    struct mls_level level[2];
-};
-
-struct context {
-    u32 user;
-    u32 role;
-    u32 type;
-    u32 len;
-    struct mls_range range;
-    char *str;
-    u32 hash;
-};
-
-struct constraint_expr {
-    u32 expr_type;
-    u32 attr;
-    u32 op;
-    struct ebitmap names;
-    struct type_set *type_names;
-    struct constraint_expr *next;
-};
-
-struct constraint_node {
-    u32 permissions;
-    struct constraint_expr *expr;
-    struct constraint_node *next;
-};
-
-struct common_datum {
-    u32 value;
-    struct symtab permissions;
-};
-
-struct class_datum {
-    u32 value;
-    char *comkey;
-    struct common_datum *comdatum;
-    struct symtab permissions;
-    struct constraint_node *constraints;
-    struct constraint_node *validatetrans;
-    char default_user;
-    char default_role;
-    char default_type;
-    char default_range;
-};
-
-struct role_datum {
-    u32 value;
-    u32 bounds;
-    struct ebitmap dominates;
-    struct ebitmap types;
-};
-
-struct role_trans {
-    u32 role;
-    u32 type;
-    u32 tclass;
-    u32 new_role;
-    struct role_trans *next;
-};
-
-struct filename_trans {
-    u32 stype;
-    u32 ttype;
-    u16 tclass;
-    const char *name;
-};
-
-struct role_allow {
-    u32 role;
-    u32 new_role;
-    struct role_allow *next;
-};
-
-struct type_datum {
-    u32 value;
-    u32 bounds;
-    unsigned char primary;
-    unsigned char attribute;
-};
-
-struct user_datum {
-    u32 value;
-    u32 bounds;
-    struct ebitmap roles;
-    struct mls_range range;
-    struct mls_level dfltlevel;
-};
-
-struct level_datum {
-    struct mls_level *level;
-    unsigned char isalias;
-};
-
-struct cat_datum {
-    u32 value;
-    unsigned char isalias;
-};
-
-struct range_trans {
-    u32 source_type;
-    u32 target_type;
-    u32 target_class;
-};
-
-struct cond_bool_datum {
-    u32 value;
-    int state;
-};
-
-struct cond_node;
-
-struct type_set {
-    struct ebitmap types;
-    struct ebitmap negset;
-    u32 flags;
-};
-
-struct ocontext {
-    union {
-        char *name;
-        struct {
-            u8 protocol;
-            u16 low_port;
-            u16 high_port;
-        } port;
-        struct {
-            u32 addr;
-            u32 mask;
-        } node;
-        struct {
-            u32 addr[4];
-            u32 mask[4];
-        } node6;
-        struct {
-            u64 subnet_prefix;
-            u16 low_pkey;
-            u16 high_pkey;
-        } ibpkey;
-        struct {
-            char *dev_name;
-            u8 port;
-        } ibendport;
-    } u;
-    union {
-        u32 sclass;
-        u32 behavior;
-    } v;
-    struct context context[2];
-    u32 sid[2];
-    struct ocontext *next;
-};
-
-struct genfs {
-    char *fstype;
-    struct ocontext *head;
-    struct genfs *next;
-};
-
-struct avtab_key {
-    u16 source_type;
-    u16 target_type;
-    u16 target_class;
-    u16 specified;
-};
-
-#define AVTAB_ALLOWED 0x0001
-#define AVTAB_AUDITALLOW 0x0002
-#define AVTAB_AUDITDENY 0x0004
-#define AVTAB_AV (AVTAB_ALLOWED | AVTAB_AUDITALLOW | AVTAB_AUDITDENY)
-#define AVTAB_XPERMS_ALLOWED 0x0100
-#define AVTAB_XPERMS_AUDITALLOW 0x0200
-#define AVTAB_XPERMS_DONTAUDIT 0x0400
-#define AVTAB_XPERMS (AVTAB_XPERMS_ALLOWED | AVTAB_XPERMS_AUDITALLOW | AVTAB_XPERMS_DONTAUDIT)
-#define AVTAB_XPERMS_IOCTLFUNCTION 0x01
-#define AVTAB_XPERMS_IOCTLDRIVER 0x02
-
-struct avtab_extended_perms {
-    u8 specified;
-    u8 driver;
-    struct extended_perms_data perms;
-};
-
-struct avtab_datum {
-    union {
-        u32 data;
-        struct avtab_extended_perms *xperms;
-    } u;
-};
-
-struct avtab_node {
-    struct avtab_key key;
-    struct avtab_datum datum;
-    struct avtab_node *next;
-};
-
-struct avtab {
-    struct flex_array *htable;
-    u32 nel;
-    u32 nslot;
-    u32 mask;
-};
-
-#define SYM_COMMONS 0
-#define SYM_CLASSES 1
-#define SYM_ROLES 2
-#define SYM_TYPES 3
-#define SYM_USERS 4
-#define SYM_BOOLS 5
-#define SYM_LEVELS 6
-#define SYM_CATS 7
-#define SYM_NUM 8
-#define OCON_ISID 0
-#define OCON_FS 1
-#define OCON_PORT 2
-#define OCON_NETIF 3
-#define OCON_NODE 4
-#define OCON_FSUSE 5
-#define OCON_NODE6 6
-#define OCON_IBPKEY 7
-#define OCON_IBENDPORT 8
-#define OCON_NUM 9
-
-struct policydb {
-    int mls_enabled;
-    int android_netlink_route;
-    int android_netlink_getneigh;
-    struct symtab symtab[SYM_NUM];
-    struct flex_array *sym_val_to_name[SYM_NUM];
-    struct class_datum **class_val_to_struct;
-    struct role_datum **role_val_to_struct;
-    struct user_datum **user_val_to_struct;
-    struct flex_array *type_val_to_struct_array;
-    struct avtab te_avtab;
-    struct role_trans *role_tr;
-    struct ebitmap filename_trans_ttypes;
-    struct hashtab *filename_trans;
-    struct cond_bool_datum **bool_val_to_struct;
-    struct avtab te_cond_avtab;
-    struct cond_node *cond_list;
-    struct role_allow *role_allow;
-    struct ocontext *ocontexts[OCON_NUM];
-    struct genfs *genfs;
-    struct hashtab *range_tr;
-    struct flex_array *type_attr_map_array;
-    struct ebitmap policycaps;
-    struct ebitmap permissive_map;
-    size_t len;
-    unsigned int policyvers;
-    unsigned int reject_unknown : 1;
-    unsigned int allow_unknown : 1;
-    u16 process_class;
-    u32 process_trans_perms;
-};
-
 static int (*policydb_read_fn)(struct policydb *policydb, struct policy_file *fp);
 static void (*policydb_destroy_fn)(struct policydb *policydb);
-static void *(*flex_array_get_fn)(struct flex_array *fa, unsigned int element_nr);
-static struct avtab_node *(*avtab_search_node_fn)(struct avtab *h, struct avtab_key *key);
-static struct avtab_node *(*avtab_search_node_next_fn)(struct avtab_node *node, int specified);
-static void (*cond_compute_av_fn)(struct avtab *ctab, struct avtab_key *key,
-                                  struct av_decision *avd, struct extended_perms *xperms);
-static int (*constraint_expr_eval_fn)(struct policydb *policydb,
-                                      struct context *scontext,
-                                      struct context *tcontext,
-                                      struct context *xcontext,
-                                      struct constraint_expr *cexpr);
-static void (*type_attribute_bounds_av_fn)(struct policydb *policydb,
-                                           struct context *scontext,
-                                           struct context *tcontext,
-                                           u16 tclass,
-                                           struct av_decision *avd);
 static void *(*vmalloc_fn)(unsigned long size);
 static void *(*vmalloc_to_page_fn)(const void *addr);
 static void (*vfree_fn)(const void *addr);
@@ -462,17 +159,11 @@ static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
 
 static bool contains_magisk(const char *s, size_t len);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
-static bool dirtysepolicy_context_should_hide(const char *query);
-static bool dirtysepolicy_access_should_deny(const char *query, size_t len);
-static bool clean_context_exists(const char *query);
-static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query);
-static bool legacy_should_block_access_query(const char *query, size_t len);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
 static bool should_log_live_bypass(uid_t uid);
 static void log_bypass_once(const char *node, uid_t uid, const char *query);
 static bool use_legacy_clean_blob_query(void);
-static bool selinux_414_compat_path(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_state_arg_required(void);
 static bool selinux_compat_call_needed(void);
@@ -485,16 +176,9 @@ static bool snapshot_magisk_policy_file(const char *reason, bool try_relative);
 static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, bool allow_fallback);
 static void before_security_load_policy(hook_fargs4_t *a, void *u);
 static void after_security_load_policy(hook_fargs4_t *a, void *u);
-static bool context_struct_compute_av_intel(struct policydb *policydb,
-                                            struct context *scontext,
-                                            struct context *tcontext,
-                                            u16 tclass,
-                                            struct av_decision *avd,
-                                            struct extended_perms *xperms);
 static void try_load_clean_policydb_from_blob(const char *reason);
 static void before_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
 static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
-static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u);
 static void before_sel_read_handle_status(hook_fargs4_t *a, void *u);
 static void after_sel_read_handle_status(hook_fargs4_t *a, void *u);
 static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u);
@@ -748,11 +432,6 @@ static bool use_legacy_clean_blob_query(void)
     return kver < SELINUX_LEGACY_BLOB_QUERY_MAX;
 }
 
-static bool selinux_414_compat_path(void)
-{
-    return kver < VERSION(4, 15, 0);
-}
-
 static bool clean_policydb_redirect_supported(void)
 {
     /*
@@ -770,15 +449,15 @@ static bool clean_policydb_redirect_supported(void)
      *       sel_write_access(), sel_write_context(), write_op[]
      *
      * 这里的 4.14 适配不是单纯按 kver 猜 ABI，而是用上述 cepheus/sm8150
-     * 4.14 源码确认 SELinux helper 的真实签名。只要运行时能解析到
-     * selinux_state，就认为它符合这组 4.14 stateful SELinux 布局；否则
-     * 回退到更保守的 legacy 路径，避免把 policydb 参数强套到未知布局上。
+      * 4.14 源码确认 SELinux helper 的真实签名。只要运行时能解析到
+      * selinux_state，就认为它符合这组 4.14 stateful SELinux 布局；否则
+      * policydb redirect 保持关闭，避免把参数强套到未知布局上。
      *
      * The Xiaomi sm8150/cepheus 4.14 lineage keeps selinux_state and also uses
      * the policydb-argument context_struct_compute_av() signature.  Therefore
      * selinux_state is the runtime confidence signal for using the 4.14
      * stateful SELinux helper signatures and the 6-argument policydb redirect
-     * path.  Kernels older than this baseline stay on the pure legacy route.
+      * path. Kernels older than this baseline do not install policydb hooks.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
@@ -831,7 +510,7 @@ static bool write_op_slot_fallback_allowed(void)
 {
     /*
      * The audited stateful 4.14 layout has the same context/access slots as
-     * newer kernels. Keep unknown legacy layouts on the direct-symbol path.
+     * newer kernels. Keep unknown layouts off the pointer-table path.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
@@ -1201,212 +880,6 @@ static void log_symbol_addr(const char *name, const void *addr)
             name ?: "(null)", addr ? "found" : "missing", addr);
 }
 
-static unsigned int ebitmap_start_positive_intel(struct ebitmap *e,
-                                                 struct ebitmap_node **node)
-{
-    unsigned int map_i;
-    unsigned int bit_i;
-
-    if (!e || !node)
-        return 0;
-
-    for (*node = e->node; *node; *node = (*node)->next) {
-        for (map_i = 0; map_i < SELINUX_EBITMAP_UNIT_NUMS; map_i++) {
-            unsigned long map = (*node)->maps[map_i];
-
-            if (!map)
-                continue;
-            for (bit_i = 0; bit_i < SELINUX_EBITMAP_UNIT_BITS; bit_i++) {
-                if (map & (1UL << bit_i))
-                    return (*node)->startbit +
-                           map_i * SELINUX_EBITMAP_UNIT_BITS + bit_i;
-            }
-        }
-    }
-
-    return e->highbit;
-}
-
-static unsigned int ebitmap_next_positive_intel(struct ebitmap *e,
-                                                struct ebitmap_node **node,
-                                                unsigned int bit)
-{
-    unsigned int absolute;
-    unsigned int offset;
-    unsigned int map_i;
-    unsigned int bit_i;
-
-    if (!e || !node || !*node)
-        return e ? e->highbit : 0;
-
-    absolute = bit + 1;
-    while (*node) {
-        if (absolute < (*node)->startbit)
-            absolute = (*node)->startbit;
-        offset = absolute - (*node)->startbit;
-        map_i = offset / SELINUX_EBITMAP_UNIT_BITS;
-        bit_i = offset % SELINUX_EBITMAP_UNIT_BITS;
-
-        for (; map_i < SELINUX_EBITMAP_UNIT_NUMS; map_i++) {
-            unsigned long map = (*node)->maps[map_i];
-
-            for (; bit_i < SELINUX_EBITMAP_UNIT_BITS; bit_i++) {
-                if (map & (1UL << bit_i))
-                    return (*node)->startbit +
-                           map_i * SELINUX_EBITMAP_UNIT_BITS + bit_i;
-            }
-            bit_i = 0;
-        }
-
-        *node = (*node)->next;
-        if (*node)
-            absolute = (*node)->startbit;
-    }
-
-    return e->highbit;
-}
-
-#define ebitmap_for_each_positive_bit_intel(e, n, bit) \
-    for ((bit) = ebitmap_start_positive_intel((e), &(n)); \
-         (bit) < (e)->highbit; \
-         (bit) = ebitmap_next_positive_intel((e), &(n), (bit)))
-
-static void services_compute_xperms_drivers_intel(struct extended_perms *xperms,
-                                                  struct avtab_node *node)
-{
-    unsigned int i;
-
-    if (!xperms || !node || !node->datum.u.xperms)
-        return;
-
-    if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLDRIVER) {
-        for (i = 0; i < sizeof(xperms->drivers.p) / sizeof(xperms->drivers.p[0]); i++)
-            xperms->drivers.p[i] |= node->datum.u.xperms->perms.p[i];
-    } else if (node->datum.u.xperms->specified == AVTAB_XPERMS_IOCTLFUNCTION) {
-        security_xperm_set(xperms->drivers.p, node->datum.u.xperms->driver);
-    }
-
-    if (node->key.specified & AVTAB_XPERMS_ALLOWED)
-        xperms->len = 1;
-}
-
-static bool context_struct_compute_av_intel(struct policydb *policydb,
-                                            struct context *scontext,
-                                            struct context *tcontext,
-                                            u16 tclass,
-                                            struct av_decision *avd,
-                                            struct extended_perms *xperms)
-{
-    struct constraint_node *constraint;
-    struct role_allow *ra;
-    struct avtab_key avkey;
-    struct avtab_node *node;
-    struct class_datum *tclass_datum;
-    struct ebitmap *sattr;
-    struct ebitmap *tattr;
-    struct ebitmap_node *snode;
-    struct ebitmap_node *tnode;
-    unsigned int i;
-    unsigned int j;
-
-    if (!policydb || !scontext || !tcontext || !avd)
-        return false;
-
-    avd->allowed = 0;
-    avd->auditallow = 0;
-    avd->auditdeny = 0xffffffff;
-    if (xperms) {
-        zero_bytes(&xperms->drivers, sizeof(xperms->drivers));
-        xperms->len = 0;
-    }
-
-    if (unlikely(!tclass || tclass > policydb->symtab[SYM_CLASSES].nprim)) {
-        pr_warn("[selinux_hook] intel_av invalid class %hu\n", tclass);
-        return false;
-    }
-
-    if (!policydb->class_val_to_struct) {
-        pr_warn("[selinux_hook] intel_av missing class_val_to_struct policydb=%px\n",
-                policydb);
-        return false;
-    }
-
-    tclass_datum = policydb->class_val_to_struct[tclass - 1];
-    if (!tclass_datum) {
-        pr_warn("[selinux_hook] intel_av missing class datum class=%hu policydb=%px\n",
-                tclass, policydb);
-        return false;
-    }
-
-    if (!flex_array_get_fn || !avtab_search_node_fn || !avtab_search_node_next_fn) {
-        pr_warn("[selinux_hook] intel_av missing core helpers flex=%px search=%px next=%px\n",
-                flex_array_get_fn, avtab_search_node_fn, avtab_search_node_next_fn);
-        return false;
-    }
-
-    avkey.target_class = tclass;
-    avkey.specified = AVTAB_AV | AVTAB_XPERMS;
-    sattr = (struct ebitmap *)flex_array_get_fn(policydb->type_attr_map_array,
-                                                scontext->type - 1);
-    tattr = (struct ebitmap *)flex_array_get_fn(policydb->type_attr_map_array,
-                                                tcontext->type - 1);
-    if (!sattr || !tattr) {
-        pr_warn("[selinux_hook] intel_av missing attr map s_type=%u t_type=%u sattr=%px tattr=%px policydb=%px\n",
-                scontext->type, tcontext->type, sattr, tattr, policydb);
-        return false;
-    }
-
-    ebitmap_for_each_positive_bit_intel(sattr, snode, i) {
-        ebitmap_for_each_positive_bit_intel(tattr, tnode, j) {
-            avkey.source_type = i + 1;
-            avkey.target_type = j + 1;
-            for (node = avtab_search_node_fn(&policydb->te_avtab, &avkey);
-                 node;
-                 node = avtab_search_node_next_fn(node, avkey.specified)) {
-                if (node->key.specified == AVTAB_ALLOWED)
-                    avd->allowed |= node->datum.u.data;
-                else if (node->key.specified == AVTAB_AUDITALLOW)
-                    avd->auditallow |= node->datum.u.data;
-                else if (node->key.specified == AVTAB_AUDITDENY)
-                    avd->auditdeny &= node->datum.u.data;
-                else if (xperms && (node->key.specified & AVTAB_XPERMS))
-                    services_compute_xperms_drivers_intel(xperms, node);
-            }
-
-            if (cond_compute_av_fn)
-                cond_compute_av_fn(&policydb->te_cond_avtab, &avkey, avd, xperms);
-        }
-    }
-
-    constraint = tclass_datum->constraints;
-    while (constraint) {
-        if ((constraint->permissions & avd->allowed) &&
-            constraint_expr_eval_fn &&
-            !constraint_expr_eval_fn(policydb, scontext, tcontext, NULL,
-                                     constraint->expr)) {
-            avd->allowed &= ~constraint->permissions;
-        }
-        constraint = constraint->next;
-    }
-
-    if (tclass == policydb->process_class &&
-        (avd->allowed & policydb->process_trans_perms) &&
-        scontext->role != tcontext->role) {
-        for (ra = policydb->role_allow; ra; ra = ra->next) {
-            if (scontext->role == ra->role &&
-                tcontext->role == ra->new_role)
-                break;
-        }
-        if (!ra)
-            avd->allowed &= ~policydb->process_trans_perms;
-    }
-
-    if (type_attribute_bounds_av_fn)
-        type_attribute_bounds_av_fn(policydb, scontext, tcontext, tclass, avd);
-
-    return true;
-}
-
 static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count, loff_t *pos)
 {
     if (!kernel_read_fn)
@@ -1727,359 +1200,6 @@ static size_t copy_query_sample(char *dst, const char *src, size_t size)
     return sanitize_query_sample(dst, (size_t)copied);
 }
 
-static size_t token_len(const char *s)
-{
-    size_t i = 0;
-
-    if (!s)
-        return 0;
-
-    while (s[i] && s[i] != ' ' && s[i] != '\n' && s[i] != '\r' && s[i] != '\t')
-        i++;
-    return i;
-}
-
-static const char *skip_spaces(const char *s)
-{
-    while (s && (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t'))
-        s++;
-    return s;
-}
-
-static bool clean_blob_has_name(const char *name, size_t len)
-{
-    const char *blob = (const char *)READ_ONCE(g_clean_policy_blob);
-    size_t blob_len = READ_ONCE(g_clean_policy_len);
-    size_t i;
-
-    if (!blob || !blob_len || !name || !len)
-        return true;
-
-    for (i = 0; i + len <= blob_len; i++) {
-        size_t j;
-
-        for (j = 0; j < len; j++) {
-            if (blob[i + j] != name[j])
-                break;
-        }
-        if (j == len)
-            return true;
-    }
-
-    return false;
-}
-
-static bool clean_context_token_exists(const char *ctx, size_t len)
-{
-    size_t i;
-    size_t first = (size_t)-1;
-    size_t second = (size_t)-1;
-    size_t third = (size_t)-1;
-
-    if (!ctx || !len)
-        return true;
-
-    for (i = 0; i < len; i++) {
-        if (ctx[i] != ':')
-            continue;
-        if (first == (size_t)-1)
-            first = i;
-        else if (second == (size_t)-1)
-            second = i;
-        else {
-            third = i;
-            break;
-        }
-    }
-
-    if (second == (size_t)-1)
-        return true;
-
-    if (third == (size_t)-1)
-        third = len;
-
-    if (third <= second + 1)
-        return false;
-
-    return clean_blob_has_name(ctx + second + 1, third - second - 1);
-}
-
-static bool clean_context_exists(const char *query)
-{
-    query = skip_spaces(query);
-    return clean_context_token_exists(query, token_len(query));
-}
-
-static bool token_eq_lit(const char *token, size_t len, const char *lit)
-{
-    size_t i;
-
-    if (!token || !lit)
-        return false;
-
-    for (i = 0; i < len; i++) {
-        if (!lit[i] || !ascii_lower_eq(token[i], lit[i]))
-            return false;
-    }
-
-    return lit[i] == '\0';
-}
-
-static bool context_token_matches(const char *query, const char *lit)
-{
-    const char *ctx = skip_spaces(query);
-
-    return token_eq_lit(ctx, token_len(ctx), lit);
-}
-
-static bool dirtysepolicy_context_should_hide(const char *query)
-{
-    if (!selinux_414_compat_path())
-        return false;
-
-    /*
-     * DirtySepolicy reference:
-     *   https://github.com/LSPosed/DirtySepolicy/tree/0cda3b89cd168c88cbf639da9e3d4f44d70c0b78
-     *
-     * Relevant source paths:
-     *   - app/src/main/java/org/lsposed/dirtysepolicy/AppZygote.java
-     *       contextExists("u:r:adbroot:s0")
-     *       contextExists("u:r:magisk:s0")
-     *       contextExists("u:object_r:magisk_file:s0")
-     *       contextExists("u:r:ksu:s0")
-     *       contextExists("u:object_r:ksu_file:s0")
-     *       contextExists("u:object_r:lsposed_file:s0")
-     *       contextExists("u:object_r:xposed_data:s0")
-     *       contextExists("u:object_r:xposed_file:s0")
-     *   - app/src/main/java/org/lsposed/dirtysepolicy/SELinux.java
-     *       contextExists() first writes /sys/fs/selinux/context.
-     *       On EINVAL it falls back to /sys/fs/selinux/access.
-     *       On EINVAL again it writes /proc/self/attr/current; EPERM is still
-     *       interpreted as "context exists".
-     *
-     * DirtySepolicy 的 contextExists() 不是只测 /sys/fs/selinux/context。
-     * 如果这里只拦 context 节点，它还会继续走 access fallback，最后再写
-     * /proc/self/attr/current；其中 EPERM 也会被它当成“上下文存在”。因此
-     * 这些敏感 context 必须在三条路径里都表现成 EINVAL/不存在。
-     *
-     * Because of that three-stage fallback, hiding a dirty context requires all
-     * three kernel paths to return an "invalid context" style result for
-     * app-side probes.
-     */
-    if (context_token_matches(query, "u:r:adbroot:s0"))
-        return true;
-    if (context_token_matches(query, "u:r:magisk:s0"))
-        return true;
-    if (context_token_matches(query, "u:object_r:magisk_file:s0"))
-        return true;
-    if (context_token_matches(query, "u:r:ksu:s0"))
-        return true;
-    if (context_token_matches(query, "u:object_r:ksu_file:s0"))
-        return true;
-    if (context_token_matches(query, "u:object_r:lsposed_file:s0"))
-        return true;
-    if (context_token_matches(query, "u:object_r:xposed_data:s0"))
-        return true;
-    if (context_token_matches(query, "u:object_r:xposed_file:s0"))
-        return true;
-
-    return false;
-}
-
-static const char *next_token(const char *s)
-{
-    s = skip_spaces(s);
-    while (s && *s && *s != ' ' && *s != '\n' && *s != '\r' && *s != '\t')
-        s++;
-    return skip_spaces(s);
-}
-
-static bool clean_access_contexts_exist(const char *query)
-{
-    const char *src;
-    const char *dst;
-    size_t src_len;
-    size_t dst_len;
-
-    src = skip_spaces(query);
-    src_len = token_len(src);
-    if (!clean_context_token_exists(src, src_len))
-        return false;
-
-    dst = next_token(src);
-    dst_len = token_len(dst);
-    if (!clean_context_token_exists(dst, dst_len))
-        return false;
-
-    return true;
-}
-
-static bool access_contexts_match(const char *query, const char *src_lit,
-                                  const char *dst_lit)
-{
-    const char *src;
-    const char *dst;
-
-    src = skip_spaces(query);
-    dst = next_token(src);
-
-    return token_eq_lit(src, token_len(src), src_lit) &&
-           token_eq_lit(dst, token_len(dst), dst_lit);
-}
-
-static bool access_query_matches3(const char *query, const char *src_lit,
-                                  const char *dst_lit, const char *class_lit)
-{
-    const char *src;
-    const char *dst;
-    const char *tclass;
-
-    src = skip_spaces(query);
-    dst = next_token(src);
-    tclass = next_token(dst);
-
-    return token_eq_lit(src, token_len(src), src_lit) &&
-           token_eq_lit(dst, token_len(dst), dst_lit) &&
-           token_eq_lit(tclass, token_len(tclass), class_lit);
-}
-
-static bool dirtysepolicy_avd_seqno_probe(const char *query, size_t len)
-{
-    if (!query || !len)
-        return false;
-
-    /*
-     * AppZygote.java checks avd[4] from:
-     *   SELinux.access("u:r:untrusted_app:s0",
-     *                  "u:r:untrusted_app:s0", 0)
-     *
-     * 这条不是 allow/deny 探针，而是读取 /sys/fs/selinux/access 返回的
-     * av_decision.seqno。只 patch /sys/fs/selinux/status 不够；这里直接识别
-     * 固定查询并返回 clean seqno=1，避免 live policy seqno 泄漏。
-     */
-    return access_query_matches3(query, "u:r:untrusted_app:s0",
-                                 "u:r:untrusted_app:s0", "0");
-}
-
-static long write_clean_access_seqno_response(char *buf, size_t size)
-{
-    static const char response[] = "0 0 0 0 1 0";
-    size_t len = sizeof(response) - 1;
-
-    if (!buf || size < len)
-        return -EINVAL;
-
-    copy_bytes(buf, response, len);
-    if (size > len)
-        buf[len] = '\0';
-
-    return (long)len;
-}
-
-static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
-{
-    const char *src;
-    const char *dst;
-
-    if (!selinux_414_compat_path())
-        return false;
-    if (!query || !len)
-        return false;
-
-    src = skip_spaces(query);
-    dst = next_token(src);
-
-    /*
-     * contextExists() second stage calls /access with the same hidden context
-     * as source and target.  Hide either side to keep the fallback consistent.
-     *
-     * 这是为了堵住 contextExists() 的第二段 fallback：它会拿同一个 context
-     * 当源和目标去查 /access。只要源或目标是需要隐藏的 dirty context，
-     * 这里就直接 deny。
-     */
-    if (dirtysepolicy_context_should_hide(src) ||
-        dirtysepolicy_context_should_hide(dst))
-        return true;
-
-    /*
-     * AppZygote.java DirtySepolicy access probes:
-     *   system_server -> system_server        process execmem
-     *   shell         -> su                   process transition
-     *   rootfs        -> tmpfs                filesystem associate
-     *   kernel        -> tmpfs                fifo_file open
-     *   kernel        -> adb_data_file        file read
-     *   system_server -> apk_data_file        file execute
-     *   dex2oat       -> dex2oat_exec         file execute_no_trans
-     *   zygote        -> adb_data_file        dir search
-     *
-     * SELinux.java resolves the class/permission bit separately from
-     * /sys/fs/selinux/class and then checks the returned av_decision.allowed.
-     * Matching the context pair here is enough to force the DirtySepolicy
-     * result to false while leaving policy-manager processes bypassed earlier.
-     *
-     * DirtySepolicy 会先从 /sys/fs/selinux/class 读 class/perm 编号，再向
-     * /access 写入 source context、target context 和 class id。这里按它
-     * 固定使用的 context 对拦截即可；管理进程已经在入口处 bypass，不影响
-     * APatch/magiskpolicy 自己操作策略。
-     */
-    if (access_contexts_match(query, "u:r:system_server:s0", "u:r:system_server:s0"))
-        return true;
-    if (access_contexts_match(query, "u:r:shell:s0", "u:r:su:s0"))
-        return true;
-    if (access_contexts_match(query, "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0"))
-        return true;
-    if (access_contexts_match(query, "u:r:kernel:s0", "u:object_r:tmpfs:s0"))
-        return true;
-    if (access_contexts_match(query, "u:r:kernel:s0", "u:object_r:adb_data_file:s0"))
-        return true;
-    if (access_contexts_match(query, "u:r:system_server:s0", "u:object_r:apk_data_file:s0"))
-        return true;
-    if (access_contexts_match(query, "u:r:dex2oat:s0", "u:object_r:dex2oat_exec:s0"))
-        return true;
-    if (access_contexts_match(query, "u:r:zygote:s0", "u:object_r:adb_data_file:s0"))
-        return true;
-
-    return false;
-}
-
-static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query)
-{
-    if (access_query && dirtysepolicy_access_should_deny(query, len))
-        return true;
-    if (!access_query && dirtysepolicy_context_should_hide(query))
-        return true;
-    if (legacy_should_block_access_query(query, len))
-        return true;
-    if (!READ_ONCE(g_clean_policy_blob))
-        return false;
-
-    if (access_query)
-        return !clean_access_contexts_exist(query);
-
-    return !clean_context_exists(query);
-}
-
-static bool legacy_should_block_access_query(const char *query, size_t len)
-{
-    if (!query || !len)
-        return false;
-
-    if (dirtysepolicy_access_should_deny(query, len))
-        return true;
-    if (contains_case_literal(query, len, "magisk"))
-        return true;
-    if (contains_case_literal(query, len, "ksu_file"))
-        return true;
-    if (contains_case_literal(query, len, "lsposed_file"))
-        return true;
-    if (contains_case_literal(query, len, "xposed_data"))
-        return true;
-    if (contains_case_literal(query, len, "adbroot"))
-        return true;
-
-    return false;
-}
-
 static bool enter_clean_eval_scope(void)
 {
     void *task = current;
@@ -2358,6 +1478,10 @@ static void try_complete_deferred_write_op_install(const char *reason)
 {
     int rc;
 
+    if (!clean_policydb_redirect_supported()) {
+        WRITE_ONCE(g_write_op_install_deferred, false);
+        return;
+    }
     if (!READ_ONCE(g_write_op_install_deferred))
         return;
     if (READ_ONCE(g_write_op_access_patched) ||
@@ -2469,48 +1593,6 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
     try_complete_deferred_write_op_install("context_struct_compute_av");
 }
 
-static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
-{
-    struct policydb *clean_pdb;
-    struct context *scontext;
-    struct context *tcontext;
-    u16 tclass;
-    struct av_decision *avd;
-    struct extended_perms *xperms;
-    struct av_decision clean_avd;
-
-    if (should_bypass_clean_filter(current_uid()))
-        return;
-
-    clean_pdb = (struct policydb *)READ_ONCE(g_clean_policydb);
-    if (clean_pdb && !READ_ONCE(g_clean_policydb_av_disabled)) {
-        scontext = (struct context *)a->arg0;
-        tcontext = (struct context *)a->arg1;
-        tclass = (u16)a->arg2;
-        avd = (struct av_decision *)a->arg3;
-        xperms = (struct extended_perms *)a->arg4;
-
-        if (context_struct_compute_av_intel(clean_pdb, scontext, tcontext,
-                                            tclass, &clean_avd, xperms)) {
-            clean_avd.seqno = SELINUX_STATUS_CLEAN_SEQUENCE;
-            clean_avd.flags = avd->flags;
-            *avd = clean_avd;
-            a->skip_origin = 1;
-            return;
-        }
-
-        WRITE_ONCE(g_clean_policydb_av_disabled, true);
-        pr_warn("[selinux_hook] legacy clean policydb AV disabled kver=%x policydb=%px tclass=%hu; falling back to live compute\n",
-                kver, clean_pdb, tclass);
-    }
-
-    if (!READ_ONCE(g_selinux_ready)) {
-        WRITE_ONCE(g_selinux_ready, true);
-        selinux_hook_dbg("[selinux_hook] SELinux ready inferred from legacy context_struct_compute_av\n");
-    }
-
-}
-
 /* Hook: /sys/fs/selinux/access write handler */
 static void before_sel_write_access(hook_fargs4_t *a, void *u)
 {
@@ -2520,7 +1602,6 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     // pr_info("[selinux_hook] before_sel_write_access called uid=%u\n", current_uid());
     const char *query = (const char *)a->arg1;
     size_t size = (size_t)a->arg2;
-    size_t sample_len;
     char sample[ACCESS_SAMPLE_MAX];
     u32 slot;
     u32 n;
@@ -2531,7 +1612,7 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     a->local.data2 = 0;
 
     uid = current_uid();
-    sample_len = copy_query_sample(sample, query, size);
+    copy_query_sample(sample, query, size);
 
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
@@ -2539,64 +1620,8 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
-	if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
-        long ret;
-
-        n = READ_ONCE(g_clean_access_count) + 1;
-        WRITE_ONCE(g_clean_access_count, n);
-        a->local.data0 = 5;
-        a->local.data1 = n;
-        slot = n & (ACCESS_PROBE_SLOTS - 1);
-        a->local.data2 = slot;
-        g_probes[slot].id = n;
-        g_probes[slot].uid = uid;
-        g_probes[slot].node = "access";
-        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
-
-        ret = write_clean_access_seqno_response((char *)a->arg1, size);
-        pr_info("[selinux_hook] DIRTYSEPOLICY clean avd seqno /sys/fs/selinux/access #%u uid=%d comm=%s ret=%ld query=\"%s\"\n",
-                n, uid, current_comm(), ret, sample);
-        a->skip_origin = 1;
-        a->ret = (ret > 0) ? (uint64_t)ret : (uint64_t)-EINVAL;
-        return;
-    }
-
-    if (!clean_policydb_redirect_supported()) {
-        snapshot_clean_policy("legacy_access");
-        if (legacy_clean_query_should_block(sample, sample_len, true)) {
-            n = READ_ONCE(g_clean_access_count) + 1;
-            WRITE_ONCE(g_clean_access_count, n);
-            a->local.data0 = 2;
-            a->local.data1 = n;
-            slot = n & (ACCESS_PROBE_SLOTS - 1);
-            a->local.data2 = slot;
-            g_probes[slot].id = n;
-            g_probes[slot].uid = uid;
-            g_probes[slot].node = "access";
-            copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
-            a->skip_origin = 1;
-            a->ret = -EINVAL;
-        }
-        return;
-    }
-
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
-
-    if (!READ_ONCE(g_clean_policydb) && READ_ONCE(g_clean_policy_blob) &&
-        legacy_should_block_access_query(sample, sample_len)) {
-        a->local.data0 = 2;
-        a->local.data1 = n;
-        slot = n & (ACCESS_PROBE_SLOTS - 1);
-        a->local.data2 = slot;
-        g_probes[slot].id = n;
-        g_probes[slot].uid = uid;
-        g_probes[slot].node = "access";
-        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
-        return;
-    }
 
     /* Run the original selinuxfs write_op under the current task's clean scope. */
     a->local.data0 = 3;
@@ -2619,7 +1644,6 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
 {
     const char *query = (const char *)a->arg1;
     size_t size = (size_t)a->arg2;
-    size_t sample_len;
     char sample[ACCESS_SAMPLE_MAX];
     u32 slot;
     u32 n;
@@ -2630,30 +1654,11 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     a->local.data2 = 0;
 
     uid = current_uid();
-    sample_len = copy_query_sample(sample, query, size);
+    copy_query_sample(sample, query, size);
 
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("context", uid, sample);
-        return;
-    }
-
-    if (!clean_policydb_redirect_supported()) {
-        snapshot_clean_policy("legacy_context");
-        if (legacy_clean_query_should_block(sample, sample_len, false)) {
-            n = READ_ONCE(g_clean_access_count) + 1;
-            WRITE_ONCE(g_clean_access_count, n);
-            a->local.data0 = 2;
-            a->local.data1 = n;
-            slot = n & (ACCESS_PROBE_SLOTS - 1);
-            a->local.data2 = slot;
-            g_probes[slot].id = n;
-            g_probes[slot].uid = uid;
-            g_probes[slot].node = "context";
-            copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
-            a->skip_origin = 1;
-            a->ret = -EINVAL;
-        }
         return;
     }
 
@@ -2871,6 +1876,9 @@ static int install_write_op_hooks(bool allow_slot_fallback)
     sel_write_op_fn *write_op;
     hook_err_t hook_err;
     int rc;
+
+    if (!clean_policydb_redirect_supported())
+        return -EOPNOTSUPP;
 
     if (READ_ONCE(g_write_op_access_patched) ||
         READ_ONCE(g_write_op_context_patched))
@@ -3424,7 +2432,7 @@ static long init(const char *args, const char *event, void *__user r)
                      (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
-    pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d\n",
+    pr_info("[selinux_hook] kernel kver=%x legacy_blob_abi=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0);
     if (kver >= VERSION(4, 9, 0) && kver < VERSION(4, 10, 0)) {
         pr_warn("[selinux_hook] Linux 4.9.x is unsupported; skipping SELinux hooks\n");
@@ -3479,22 +2487,11 @@ static long init(const char *args, const char *event, void *__user r)
     security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
     policydb_read_fn = (void *)lookup_name_optional_suffix("policydb_read");
     policydb_destroy_fn = (void *)lookup_name_optional_suffix("policydb_destroy");
-    flex_array_get_fn = (void *)lookup_name_optional_suffix("flex_array_get");
-    avtab_search_node_fn = (void *)lookup_name_optional_suffix("avtab_search_node");
-    avtab_search_node_next_fn = (void *)lookup_name_optional_suffix("avtab_search_node_next");
-    cond_compute_av_fn = (void *)lookup_name_optional_suffix("cond_compute_av");
-    constraint_expr_eval_fn = (void *)lookup_name_optional_suffix("constraint_expr_eval");
-    type_attribute_bounds_av_fn = (void *)lookup_name_optional_suffix("type_attribute_bounds_av");
     log_symbol_addr("selinux_state", g_selinux_state);
     log_symbol_addr("security_context_to_sid", (void *)security_context_to_sid_fn);
     log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
     log_symbol_addr("policydb_read", (void *)policydb_read_fn);
     log_symbol_addr("policydb_destroy", (void *)policydb_destroy_fn);
-    log_symbol_addr("avtab_search_node", (void *)avtab_search_node_fn);
-    log_symbol_addr("avtab_search_node_next", (void *)avtab_search_node_next_fn);
-    log_symbol_addr("cond_compute_av", (void *)cond_compute_av_fn);
-    log_symbol_addr("constraint_expr_eval", (void *)constraint_expr_eval_fn);
-    log_symbol_addr("type_attribute_bounds_av", (void *)type_attribute_bounds_av_fn);
     pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d write_op_fallback=%d\n",
             selinux_compat_call_needed() ? 1 : 0,
             clean_policydb_redirect_supported() ? 1 : 0,
@@ -3502,22 +2499,12 @@ static long init(const char *args, const char *event, void *__user r)
     if (selinux_compat_call_needed())
         pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
                 kver, g_selinux_state);
-    /* Keep the clean policy snapshot available to procattr and AV filters. */
+    /* Keep the clean policy snapshot available to redirect-capable hooks. */
     snapshot_clean_policy("module_init");
     if (!security_context_to_sid_fn)
-        pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
+        pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean-policy redirect unavailable\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
-        pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, legacy clean policydb disabled\n");
-    if (!flex_array_get_fn || !avtab_search_node_fn || !avtab_search_node_next_fn)
-        pr_warn("[selinux_hook] intel_av missing core lookup helpers flex_array_get=%px avtab_search_node=%px avtab_search_node_next=%px\n",
-                flex_array_get_fn, avtab_search_node_fn, avtab_search_node_next_fn);
-    if (!cond_compute_av_fn)
-        pr_warn("[selinux_hook] intel_av cannot find cond_compute_av, conditional av rules will be skipped\n");
-    if (!constraint_expr_eval_fn)
-        pr_warn("[selinux_hook] intel_av cannot find constraint_expr_eval, class constraints will be skipped\n");
-    if (!type_attribute_bounds_av_fn)
-        pr_warn("[selinux_hook] intel_av cannot find type_attribute_bounds_av, type bounds masking will be skipped\n");
-
+        pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, clean policydb redirect disabled\n");
     addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
     if (addr) {
         record_inline_hook((void *)addr, before_simple_read_from_buffer,
@@ -3574,51 +2561,54 @@ static long init(const char *args, const char *event, void *__user r)
         selinux_hook_dbg("[selinux_hook] security_load_policy capture skipped; clean policy already loaded\n");
     }
 
-    addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
-    if (addr) {
-        record_inline_hook((void *)addr, before_selinux_setprocattr_clean_eval,
-                           after_selinux_setprocattr_clean_eval);
-        selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3 clean-eval\n");
-        hook_wrap((void *)addr, 3, before_selinux_setprocattr_clean_eval,
-                  after_selinux_setprocattr_clean_eval, NULL);
+    if (clean_policydb_redirect_supported()) {
+        addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
+        if (addr) {
+            record_inline_hook((void *)addr, before_selinux_setprocattr_clean_eval,
+                               after_selinux_setprocattr_clean_eval);
+            selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3 clean-eval\n");
+            hook_wrap((void *)addr, 3, before_selinux_setprocattr_clean_eval,
+                      after_selinux_setprocattr_clean_eval, NULL);
+        } else {
+            pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
+        }
     } else {
-        pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
+        selinux_hook_dbg("[selinux_hook] skip selinux_setprocattr clean-eval; policydb redirect unsupported\n");
     }
 
-    rc = install_write_op_hooks(event_is_post_init(event) ||
-                                READ_ONCE(g_selinux_ready));
-    if (rc == -EAGAIN) {
-        pr_info("[selinux_hook] deferring write_op slot hooks until SELinux ready (event=%s)\n",
-                event ? event : "(null)");
-        WRITE_ONCE(g_write_op_install_deferred, true);
-    } else if (rc == -EOPNOTSUPP) {
-        pr_warn("[selinux_hook] write_op slot hooks unavailable; continuing without access/context fallback\n");
-    } else if (rc) {
-        uninstall_inline_hooks();
-        return rc;
+    if (clean_policydb_redirect_supported()) {
+        rc = install_write_op_hooks(event_is_post_init(event) ||
+                                    READ_ONCE(g_selinux_ready));
+        if (rc == -EAGAIN) {
+            pr_info("[selinux_hook] deferring write_op slot hooks until SELinux ready (event=%s)\n",
+                    event ? event : "(null)");
+            WRITE_ONCE(g_write_op_install_deferred, true);
+        } else if (rc == -EOPNOTSUPP) {
+            pr_warn("[selinux_hook] write_op slot hooks unavailable; continuing without access/context redirect\n");
+        } else if (rc) {
+            uninstall_inline_hooks();
+            return rc;
+        }
+    } else {
+        WRITE_ONCE(g_write_op_install_deferred, false);
+        selinux_hook_dbg("[selinux_hook] skip /access and /context hooks; policydb redirect unsupported\n");
     }
 
     /* Policydb redirect hooks / policydb 重定向 hooks. */
 	addr = (unsigned long)lookup_name_optional_suffix("context_struct_compute_av");
 	if (!addr)
 		addr = (unsigned long)lookup_name_numbered_suffix("context_struct_compute_av");
-    if (addr) {
-        if (clean_policydb_redirect_supported()) {
-            record_inline_hook((void *)addr,
-                               before_context_struct_compute_av_policydb,
-                               after_context_struct_compute_av_policydb);
-            pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
-            hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
-                      after_context_struct_compute_av_policydb, NULL);
-        } else {
-            record_inline_hook((void *)addr,
-                               before_context_struct_compute_av_legacy, NULL);
-            pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
-            hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
-			WRITE_ONCE(g_hook_context_compute_av_ok, true); // Mark legacy AV hook mounted successfully, used to identify the working mode
-        }
-    } else {
+    if (addr && clean_policydb_redirect_supported()) {
+        record_inline_hook((void *)addr,
+                           before_context_struct_compute_av_policydb,
+                           after_context_struct_compute_av_policydb);
+        pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
+        hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
+                  after_context_struct_compute_av_policydb, NULL);
+    } else if (!addr) {
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
+    } else {
+        selinux_hook_dbg("[selinux_hook] skip context_struct_compute_av; policydb redirect unsupported\n");
     }
 
     addr = (unsigned long)lookup_name_optional_suffix("string_to_context_struct");
@@ -3627,8 +2617,6 @@ static long init(const char *args, const char *event, void *__user r)
             record_inline_hook((void *)addr, before_policydb_arg0, NULL);
             pr_info("[selinux_hook] hook string_to_context_struct argc=5\n");
             hook_wrap((void *)addr, 5, before_policydb_arg0, NULL, NULL);
-        } else {
-            pr_info("[selinux_hook] skip legacy string_to_context_struct policydb redirect\n");
         }
     } else {
         pr_warn("[selinux_hook] cannot find string_to_context_struct\n");
