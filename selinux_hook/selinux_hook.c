@@ -88,10 +88,6 @@ static bool g_clean_policy_has_magisk;
 static bool g_clean_policydb_direct;
 static void *g_clean_policydb;
 static u32 g_clean_eval_depth;
-static u32 g_bypass_access_log_count;
-static u32 g_bypass_context_log_count;
-
-static u32 g_bypass_policy_log_count;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_policy_capture_in_progress;
 
@@ -130,8 +126,6 @@ static bool contains_magisk(const char *s, size_t len);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
-static bool should_log_live_bypass(uid_t uid);
-static void log_bypass_once(const char *node, uid_t uid, const char *query);
 static bool use_legacy_clean_blob_query(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_state_arg_required(void);
@@ -361,11 +355,6 @@ static bool should_bypass_clean_filter(uid_t uid)
     return false;
 }
 
-static bool should_log_live_bypass(uid_t uid)
-{
-    return uid >= 10000;
-}
-
 static bool use_legacy_clean_blob_query(void)
 {
     return kver < SELINUX_LEGACY_BLOB_QUERY_MAX;
@@ -399,31 +388,6 @@ static bool clean_policydb_redirect_supported(void)
       * path. Kernels older than this baseline do not install policydb hooks.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
-}
-
-static u32 *bypass_counter_for_node(const char *node)
-{
-    if (str_eq_lit(node, "access"))
-        return &g_bypass_access_log_count;
-    if (str_eq_lit(node, "context"))
-        return &g_bypass_context_log_count;
-    return &g_bypass_policy_log_count;
-}
-
-static void log_bypass_once(const char *node, uid_t uid, const char *query)
-{
-    u32 *counter = bypass_counter_for_node(node);
-    u32 n = READ_ONCE(*counter);
-
-    n++;
-    WRITE_ONCE(*counter, n);
-
-    if (query)
-        selinux_hook_dbg("[selinux_hook] LIVE bypass /sys/fs/selinux/%s #%u uid=%d comm=%s query=\"%s\"\n",
-                         node ?: "?", n, uid, current_comm(), query);
-    else
-        selinux_hook_dbg("[selinux_hook] LIVE bypass /sys/fs/selinux/%s #%u uid=%d comm=%s\n",
-                         node ?: "?", n, uid, current_comm());
 }
 
 static bool selinux_compat_call_needed(void)
@@ -1341,11 +1305,8 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     uid = current_uid();
     copy_query_sample(sample, query, size);
 
-    if (should_bypass_clean_filter(uid)) {
-        if (should_log_live_bypass(uid))
-            log_bypass_once("access", uid, sample);
+    if (should_bypass_clean_filter(uid))
         return;
-    }
 
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
@@ -1383,11 +1344,8 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     uid = current_uid();
     copy_query_sample(sample, query, size);
 
-    if (should_bypass_clean_filter(uid)) {
-        if (should_log_live_bypass(uid))
-            log_bypass_once("context", uid, sample);
+    if (should_bypass_clean_filter(uid))
         return;
-    }
 
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
