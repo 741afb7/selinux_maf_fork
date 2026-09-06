@@ -1659,10 +1659,6 @@ static long init(const char *args, const char *event, void *__user r)
                      get_u32_le(g_clean_status_bytes + 12));
     pr_info("[selinux_hook] kernel kver=%x legacy_blob_abi=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0);
-    if (kver >= VERSION(4, 9, 0) && kver < VERSION(4, 10, 0)) {
-        pr_warn("[selinux_hook] Linux 4.9.x is unsupported; skipping SELinux hooks\n");
-        return 0;
-    }
     resolve_required_symbols_once();
 
     /* Raw spinlock helpers — kfunc wrappers are not exported on this kernel,
