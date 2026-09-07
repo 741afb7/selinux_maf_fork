@@ -1,19 +1,56 @@
+## Supported Kernel Versions
+
+selinux_MAF_fork is supported on:
+
+- Linux 4.19 or later
+- Some Linux 4.14 kernels (reference: 4.14.180 or later)
+
+For Linux 4.14 or earlier kernels, support requires the following SELinux
+layouts:
+
+`/security/selinux/include/security.h`
+
+```c
+extern struct page *selinux_kernel_status_page(struct selinux_state *state);
+```
+
+`/security/selinux/ss/services.c`
+
+```c
+static void context_struct_compute_av(struct policydb *policydb,
+                                      struct context *scontext,
+                                      struct context *tcontext,
+                                      u16 tclass,
+                                      struct av_decision *avd,
+                                      struct extended_perms *xperms);
+```
+
+<sub>Theoretically, some Linux 4.9 kernels may also be supported (reference: 4.9.223 or later), but they have not been thoroughly tested.</sub>
+
+## Operating Modes
+
 Use the `mode` control parameter to check the current operating mode.
 
-1. NORMAL-K (Native Redirection Mode)
+1. NORMAL
 
-The optimal operating mode of the module. It leverages the kernel's native redirection mechanism in the `context_struct_compute_av` function to redirect all AV (Access Vector) permission calculation requests directly to the clean system `policydb`, thereby fundamentally shielding Magisk-injected rules and custom security contexts.
+The normal operating mode. The kernel supports both `policydb` redirection and
+status-page redirection, and the module has successfully captured and loaded a
+clean system `policydb`. Access Vector calculations made inside the clean
+evaluation scope are redirected to that policy database, shielding them from
+Magisk-injected policy changes.
 
-2. NORMAL-M (Manual Simulation Calculation Mode)
+2. POLICYDB_REQ
 
-Legacy kernel compatibility mode. It intercepts `context_struct_compute_av` calls via an inline hook and uses a custom AV rule calculation engine to manually compute permission results using the clean `policydb`, replacing the native kernel logic.
+The kernel supports both `policydb` redirection and status-page redirection,
+but the module could not obtain a usable clean `policydb`. No manual AV
+calculation or hard-coded access/context filtering is used; SELinux policy
+evaluation remains on the kernel's live path.
 
-3. PARTIAL_FALLBACK (Partial Degradation Mode)
+3. UNSUPORRT
 
-A degraded operating mode. The clean policy has been captured, but full AV interception cannot be enabled. Only basic filtering is performed based on string patterns in the policy blob to intercept explicit Magisk context probing.
+The kernel does not support `policydb` redirection. Policy-related
+redirect and filtering hooks are disabled, while status-page handling remains
+independent; the kernel's native SELinux policy behavior is preserved.
 
-4. FULL_FALLBACK (Full Degradation Mode)
-
-The lowest protection level. No clean policy data has been captured, and only basic interception is performed using a hard-coded sensitive feature library. The module will fall back to this level during LOAD mode.
-
-The hard-coded sensitive feature library used for basic filtering is supported only on kernels running version 4.14 or lower. For kernel versions 4.19 and above, no disguise mechanism will be enabled during fallback to FULL_FALLBACK mode.
+The status-page and clean-policy capture hooks are independent of these mode
+labels and may remain active when policydb redirection is unavailable.
