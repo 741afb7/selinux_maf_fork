@@ -1266,7 +1266,6 @@ static void before_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
 
     a->local.data0 = 1;
     a->local.data1 = (uint64_t)avd;
-    a->local.data2 = READ_ONCE(avd->seqno);
     a->local.data3 = READ_ONCE(avd->flags);
 }
 
@@ -1277,7 +1276,6 @@ static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
     if (a->local.data0) {
         avd = (struct av_decision *)a->local.data1;
         if (avd) {
-            WRITE_ONCE(avd->seqno, SELINUX_STATUS_CLEAN_SEQUENCE);
             WRITE_ONCE(avd->flags, (u32)a->local.data3);
         }
     }
