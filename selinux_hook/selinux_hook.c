@@ -139,8 +139,6 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, 
 static void before_security_load_policy(hook_fargs4_t *a, void *u);
 static void after_security_load_policy(hook_fargs4_t *a, void *u);
 static void try_load_clean_policydb_from_blob(const char *reason);
-static void before_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
-static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
@@ -1209,15 +1207,13 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
 
     if (bypass)
         return;
-    
-    
+
     /*
      * Only calls running in an explicit clean-eval scope may redirect policydb
      * input.  The scope is tied to current so unrelated callers on other tasks
      * remain observational and keep using the live policydb.
      */
-    if (clean_policydb_redirect_supported() &&
-        current_in_clean_eval_scope() && clean_policydb && !bypass) {
+    if (current_in_clean_eval_scope() && clean_policydb) {
         a->arg0 = (uint64_t)clean_policydb;
         return;
     }
@@ -1246,42 +1242,6 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     }
 }
 
-static void before_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
-{
-    struct av_decision *avd;
-    void *clean_policydb;
-
-    a->local.data0 = 0;
-
-    before_policydb_arg0(a, u);
-
-    clean_policydb = READ_ONCE(g_clean_policydb);
-    if (!clean_policydb || (void *)a->arg0 != clean_policydb ||
-        !current_in_clean_eval_scope())
-        return;
-
-    avd = (struct av_decision *)a->arg4;
-    if (!avd)
-        return;
-
-    a->local.data0 = 1;
-    a->local.data1 = (uint64_t)avd;
-    a->local.data3 = READ_ONCE(avd->flags);
-}
-
-static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
-{
-    struct av_decision *avd;
-
-    if (a->local.data0) {
-        avd = (struct av_decision *)a->local.data1;
-        if (avd) {
-            WRITE_ONCE(avd->flags, (u32)a->local.data3);
-        }
-    }
-
-}
-
 /* Hook: /sys/fs/selinux/access write handler */
 static void before_sel_write_access(hook_fargs4_t *a, void *u)
 {
@@ -1297,8 +1257,6 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     uid_t uid;
 
     a->local.data0 = 0;
-    a->local.data1 = 0;
-    a->local.data2 = 0;
 
     uid = current_uid();
     copy_query_sample(sample, query, size);
@@ -1336,8 +1294,6 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     uid_t uid;
 
     a->local.data0 = 0;
-    a->local.data1 = 0;
-    a->local.data2 = 0;
 
     uid = current_uid();
     copy_query_sample(sample, query, size);
@@ -1370,12 +1326,10 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     struct access_probe *probe;
     u32 id;
     u32 slot;
-    u32 mode;
 
     if (!a->local.data0)
         return;
 
-    mode = (u32)a->local.data0;
     id = (u32)a->local.data1;
     slot = (u32)a->local.data2;
     if (a->local.data3)
@@ -1397,17 +1351,10 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
         }
     }
 
-    if (mode == 2)
-        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
-                         probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
-                         READ_ONCE(g_clean_policydb), READ_ONCE(g_clean_policy_blob),
-                         READ_ONCE(g_clean_policy_len), probe->query);
-    else
-        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
+    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
                      probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
                      READ_ONCE(g_clean_policydb), READ_ONCE(g_clean_policy_blob),
-                     READ_ONCE(g_clean_policy_len),
-                     probe->query);
+                     READ_ONCE(g_clean_policy_len), probe->query);
 }
 
 static int install_write_op_hooks(void)
@@ -1719,12 +1666,9 @@ static long init(const char *args, const char *event, void *__user r)
 	if (!addr)
 		addr = (unsigned long)lookup_name_numbered_suffix("context_struct_compute_av");
     if (addr && clean_policydb_redirect_supported()) {
-        record_inline_hook((void *)addr,
-                           before_context_struct_compute_av_policydb,
-                           after_context_struct_compute_av_policydb);
+        record_inline_hook((void *)addr, before_policydb_arg0, NULL);
         pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
-        hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
-                  after_context_struct_compute_av_policydb, NULL);
+        hook_wrap((void *)addr, 6, before_policydb_arg0, NULL, NULL);
     } else if (!addr) {
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
     } else {
